@@ -17,9 +17,26 @@ import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
+import astropy.units as u
 
 sys.path.append('../HUXt/code/')
 import huxt as H
+import huxt_inputs as Hin
+
+def get_WSA_time_dependent_boundary(start, stop):
+    
+    urls_df = fetch_WSA_maps(start, stop)
+    
+    vr, br = [], []
+    for file in urls_df.to_numpy().flatten():
+        
+        # vr_map, vr_longs, vr_lats, br_map, br_longs, br_lats, cr_num = Hin.get_WSA_maps(file)
+        
+        vr.append(Hin.get_WSA_long_profile(file, lat=0.0 * u.deg))
+        br.append(Hin.get_WSA_br_long_profile(file, lat=0.0 * u.deg))
+        
+    breakpoint()
+
 
 def get_WSA_map_urls(start, stop, version='', source='', realization='', update_reference=False):
     
@@ -171,7 +188,7 @@ def get_WSA_map_urls(start, stop, version='', source='', realization='', update_
     query_df = reference_df.query('@start <= index < @stop')
     
     result_df = pd.DataFrame(index = np.arange(start, stop, datetime.timedelta(days=1)),
-                             columns = ['filename'])
+                             columns = ['filename', 'combined_source'])
     filesfound = False
     
     # Sort reference_df columns by the supplied orders of preference
@@ -197,15 +214,17 @@ def get_WSA_map_urls(start, stop, version='', source='', realization='', update_
         for column_name in ordered_column_names:
             # If there's available file(s) in the reference, 
             # and the result row is still empty...
-            reference_has_data = not inrange_df[column_name].isna().all()
+            subset_df = inrange_df[column_name].dropna()
+            reference_has_data = len(subset_df) > 0
             result_has_data = not row.isna().all()
             if (reference_has_data == True) and (result_has_data == False):
                 
                 # Set the result file to the nearest (timewise) reference file
-                diff = [(t - index).total_seconds() for t in inrange_df.index]
+                diff = [(t - index).total_seconds() for t in subset_df.index]
                 nearest_indx = np.argmin(np.abs(diff))
-                result_df.loc[index, :] = inrange_df[column_name].iloc[nearest_indx]
-                
+                result_df.loc[index, 'filename'] = subset_df.iloc[nearest_indx]
+                result_df.loc[index, 'combined_source'] = column_name  
+        
     if result_df['filename'].isna().any() is True:
         if result_df['filename'].isna().all():
             print('No data coverage during specificed time period.')
@@ -214,7 +233,58 @@ def get_WSA_map_urls(start, stop, version='', source='', realization='', update_
             print('Incomplete data coverage during specified time period. Returning incomplete dataframe...')
     return result_df
     
-
+def fetch_WSA_maps(start, stop, path=''):
+    
+    # Get the filenames 
+    urls_df = get_WSA_map_urls(start, stop)
+    
+    # Construct URLs
+    skeleton_url = ('https://iswa.gsfc.nasa.gov/iswa_data_tree/model/solar/'
+                    '{version}/R21.5/WSA_VEL/{source}/{year}/{month}')
+    filename = 'vel_{year}{month}??????R{realization}_{suffixes}.fits'
+    
+    for index, row in urls_df.iterrows():
+        parts = row['combined_source'].split('/')
+        version = parts.pop(0)
+        realization = parts.pop()
+        source = '/'.join(parts)
+        
+        # Get the actual date of the file, which could be different from the
+        # df index
+        year = row['filename'][4:8]
+        month = row['filename'][8:10]
+        
+        url = skeleton_url.format(version = version,
+                                  source = source,
+                                  year = year,
+                                  month = month)
+        
+        url += '/' + row['filename']
+        
+        urls_df.loc[index, 'url'] = url
+    
+    # Download the files, unless they already exist locally
+    # And save the full file path for each
+    dirs = H._setup_dirs_()
+    _boundary_dir_ = dirs['boundary_conditions']
+    
+    print("Getting WSA maps...")
+    for index, row in tqdm.tqdm(urls_df.iterrows(), total=len(urls_df)):
+        
+        filepath = _boundary_dir_ + '/' + row['filename']
+        
+        # If the file isn't downloaded already, download it
+        if not os.path.exists(filepath):
+            with requests.get(row['url'], stream=True) as r:
+                r.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192): 
+                        f.write(chunk)
+                    
+        urls_df.loc[index, 'filepath'] = filepath
+     
+    
+    return urls_df['filepath']
 
 # def lookup_all_WSA():
 #     # The skeleton url used for all files
