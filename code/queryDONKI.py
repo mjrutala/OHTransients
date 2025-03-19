@@ -5,6 +5,7 @@ Created on Tue Mar  4 15:14:05 2025
 
 @author: mrutala
 """
+import astropy.units as u
 
 def CME(start, end):
     """
@@ -65,7 +66,7 @@ def CME(start, end):
     df = df.drop(index)
     return df
 
-def ICME(start, end, location='Earth'):
+def ICME(start, end, location='Earth', duration=1.5*u.day):
     """
     Read the DONKI InterPlanetary Shock (IPS) list, and optionally cross-
     reference with the DONKI CME list to identify ICMEs
@@ -114,6 +115,8 @@ def ICME(start, end, location='Earth'):
         else:
             row['linkedEvents'] = cme_df.loc[matches, 'activityID'].values[0]
             df.loc[index] = row
-    
+            
+    # Set the duration of the event
+    df['duration'] = duration
 
     return df.reset_index()
