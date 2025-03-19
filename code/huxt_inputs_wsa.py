@@ -18,27 +18,57 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import time
 import astropy.units as u
+from astropy.time import Time
 
 sys.path.append('../HUXt/code/')
 import huxt as H
 import huxt_inputs as Hin
 
-def get_WSA_time_dependent_boundary(start, stop):
+
+def get_WSA_time_dependent_boundary(runstart, runstop, nlon_grid=None, lat=0*u.deg, dt=1*u.day, ref_r=21.5*u.solRad, **kwarg):
+    # generate_vCarr_from_OMNI(runstart, runend, nlon_grid=None, omni_input=None, dt=1 * u.day, ref_r=215 * u.solRad,
+    #                              corot_type='both'):
     
-    urls_df = fetch_WSA_maps(start, stop)
+        
+    # set the default longitude grid, check specified value
+    all_lons, dlon, nlon = H.longitude_grid()
+    if nlon_grid is None:
+        nlon_grid = nlon
+    if not (nlon_grid == nlon):
+        print('Warning: vCarr generated for different longitude resolution than current HUXt default')
     
-    vr, br = [], []
-    for file in urls_df.to_numpy().flatten():
+    # compute the longitudinal and time grids
+    dphi_grid = 360 / nlon_grid
+    lon_grid = np.arange(dphi_grid / 2, 360.1 - dphi_grid / 2, dphi_grid) * np.pi / 180 * u.rad
+    dt_days = dt.to(u.day).value
+    
+    runstart_mjd = Time(runstart).mjd
+    runstop_mjd = Time(runstop).mjd
+    time_grid = np.arange(runstart_mjd, runstop_mjd, dt_days)
         
-        # vr_map, vr_longs, vr_lats, br_map, br_longs, br_lats, cr_num = Hin.get_WSA_maps(file)
+    urls_df = fetch_WSA_maps(runstart, runstop, dt=dt, **kwarg)
+    
+    vr = np.zeros([lon_grid.shape[0], time_grid.shape[0]])
+    br = np.zeros([lon_grid.shape[0], time_grid.shape[0]])
+    for num, file in enumerate(urls_df.to_numpy().flatten()):
+                
+        vr_map, vr_longs, vr_lats, br_map, br_longs, br_lats, cr_num = Hin.get_WSA_maps(file)
         
-        vr.append(Hin.get_WSA_long_profile(file, lat=0.0 * u.deg))
-        br.append(Hin.get_WSA_br_long_profile(file, lat=0.0 * u.deg))
+        vr_long = Hin.get_WSA_long_profile(file, lat=lat)
+        br_long = Hin.get_WSA_br_long_profile(file, lat=lat)
         
-    breakpoint()
+        vr[:, num] = np.interp(lon_grid.to(u.rad).value, vr_longs.to(u.rad).value, vr_long)
+        br[:, num] = np.interp(lon_grid.to(u.rad).value, br_longs.to(u.rad).value, br_long)
+
+    return time_grid, vr, br
 
 
-def get_WSA_map_urls(start, stop, version='', source='', realization='', update_reference=False):
+def get_WSA_map_urls(start, stop, dt=1*u.day, version='', source='', realization='', update_reference=False):
+    
+    # Initialize a df for the result
+    timespan = np.arange(start, stop, datetime.timedelta(days=dt.to(u.day).value))
+    result_df = pd.DataFrame(index = timespan,
+                             columns = ['filename', 'combined_source'])
     
     all_versions = ['WSA5.4', 'WSA5.X']
     all_sources = ['ADAPT/GONG', 'GONG_Z', 'GONG_B']
@@ -187,8 +217,7 @@ def get_WSA_map_urls(start, stop, version='', source='', realization='', update_
     # Select the desired range
     query_df = reference_df.query('@start <= index < @stop')
     
-    result_df = pd.DataFrame(index = np.arange(start, stop, datetime.timedelta(days=1)),
-                             columns = ['filename', 'combined_source'])
+    
     filesfound = False
     
     # Sort reference_df columns by the supplied orders of preference
@@ -233,10 +262,10 @@ def get_WSA_map_urls(start, stop, version='', source='', realization='', update_
             print('Incomplete data coverage during specified time period. Returning incomplete dataframe...')
     return result_df
     
-def fetch_WSA_maps(start, stop, path=''):
+def fetch_WSA_maps(start, stop, path='', **kwargs):
     
     # Get the filenames 
-    urls_df = get_WSA_map_urls(start, stop)
+    urls_df = get_WSA_map_urls(start, stop, **kwargs)
     
     # Construct URLs
     skeleton_url = ('https://iswa.gsfc.nasa.gov/iswa_data_tree/model/solar/'
