@@ -31,7 +31,7 @@ from scipy import stats
 
 from astroquery.jplhorizons import Horizons
 
-import huxt_inputs_wsa as Hin_wsa
+# import huxt_inputs_wsa as Hin_wsa
 import queryDONKI
 
 try:
@@ -108,7 +108,7 @@ def fetch_omni(starttime, stoptime):
     # Limit the dataframe to the requested dates
     omni = df.query('@starttime <= dt < @stoptime')
     omni = omni.rename(columns={'dt': 'datetime'})
-    omni.reset_index()
+    omni = omni.reset_index()
     
     return omni
 
@@ -135,7 +135,7 @@ _icme_df['ICME_end'] = [row['Shock_time'] + datetime.timedelta(days=(row['durati
 qomni_df = Hin.remove_ICMEs(omni_df, _icme_df, interpolate=False, icme_buffer=0.5 * u.day, interp_buffer=1 * u.day,
                             params=['U', 'BX_GSE'], fill_vals=None)
 
-qomni_df['carringtonLongitude'] = sun.L0(qomni_df.index).to(u.deg).value
+qomni_df['carringtonLongitude'] = sun.L0(qomni_df['datetime']).to(u.deg).value
 
 # %% Gaussian Process Data Imputation =========================================
 # 
@@ -283,12 +283,12 @@ def map_omni_inwards(runstart, runstop, df):
     
     # Format the OMNI DataFrame as HUXt expects it
     df['V'] = df['U']
-    df['datetime'] = df.index
-    df = df.reset_index()
+    # df['datetime'] = df.index
+    # df = df.reset_index()
     
     # Generate boundary conditions from omni dataframe
     time_omni, vcarr_omni, bcarr_omni = Hin.generate_vCarr_from_OMNI(runstart, runstop, omni_input=df)
-    breakpoint()
+    
     # Get the position of the Earth from JPL Horizons
     epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
                   'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
@@ -312,7 +312,7 @@ def map_omni_inwards(runstart, runstop, df):
         vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
                                                      210 * u.solRad,
                                                      21.5 * u.solRad)
-        breakpoint()
+        
     return time_omni, vcarr_21p5, bcarr_omni
 
 def create_CME_list(runstart, runstop):
