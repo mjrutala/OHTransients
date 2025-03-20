@@ -40,8 +40,8 @@ except:
 
 # HUXt can be easily initiated MAS, by specifying a carrington rotation number. 
 # Data are downloaded from the Pred Sci Inc archive on demand
-runstart = datetime.datetime(2024, 1, 1)
-runstop = datetime.datetime(2024, 7, 1)
+runstart = datetime.datetime(2024, 4, 1)
+runstop = datetime.datetime(2024, 6, 1)
 runtime = (runstop - runstart)
 
 
@@ -81,13 +81,16 @@ def fetch_omni(starttime, endtime):
 
 # %% Get raw OMNI data ========================================================
 # =============================================================================
+# !!!! Padding should relate to propagation time to Jupiter/Saturn
 padding = datetime.timedelta(days=27)
-omni_df = fetch_omni(runstart-padding, runstop+padding)
+runstart_padded = runstart - padding
+runstop_padded = runstop + padding
+omni_df = fetch_omni(runstart_padded, runstop_padded)
 
 # %% Get DONKI ICMEs @ OMNI ===================================================
 # Assume a generous ICME duration
 # =============================================================================
-icme_df = queryDONKI.ICME(runstart, runstop, location='Earth', duration=2.0*u.day)
+icme_df = queryDONKI.ICME(runstart_padded, runstop_padded, location='Earth', duration=2.0*u.day)
 
 # %% OMNI - ICMEs =============================================================
 # 
@@ -119,7 +122,7 @@ mid_l      = 0.05
 max_l      = 0.2
 init_var   = 3
 period = 27/(runtime.total_seconds() / (24*60*60)) * maxRescale
-n_samples = 30
+n_samples = 10
 
 X = qomni_df.dropna(axis='index', how='any')['mjd'].to_numpy('float64')[:, None]
 Y = qomni_df.dropna(axis='index', how='any')['U'].to_numpy('float64')[:, None]
@@ -135,7 +138,7 @@ Y_scaled = val_rescaler.transform(Y)
 # Simplify
 
 XY_scaled = np.array(list(zip(X_scaled.flatten(), Y_scaled.flatten())))
-n_clusters = int((runtime.total_seconds()/3600) / 12)
+n_clusters = int((runtime.total_seconds()/3600) / 6)
 kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_scaled)
 XY_clustered = kmeans.cluster_centers_
 
@@ -189,13 +192,15 @@ carrington_kernel = gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(),
 signal_kernel = small_scale_kernel + large_scale_kernel + irregularities_kernel + carrington_kernel
 
 # model = gpflow.models.GPR((X_clustered, Y_clustered), kernel=signal_kernel)
-model = gpflow.models.GPR((X_clustered, Y_clustered), kernel=signal_kernel, noise_variance=1)
+# !!!! Calculate noise_variance from clustered data
+model = gpflow.models.GPR((X_clustered, Y_clustered), kernel=signal_kernel, noise_variance=0.3)
 
 opt = gpflow.optimizers.Scipy()
 opt.minimize(model.training_loss, model.trainable_variables)
 
 # gpflow.utilities.print_summary(model)
 
+# Xp = np.arange(qomni_df['mjd'].iloc[0], qomni_df['mjd'].iloc[-1]+30, 1)[:, None]
 Xp = qomni_df['mjd'].to_numpy('float64')[:, None]
 Xp_scaled = time_rescaler.transform(Xp)
 
@@ -212,23 +217,29 @@ Yo_sig = Yp_scaled_std * val_rescaler.scale_
 Fo_samples = np.array([val_rescaler.inverse_transform(f) for f in f_scaled_samples])
 
 fig, ax = plt.subplots()
-ax.scatter(X, Y, label="Observations", color='black', marker='.', s=2, zorder=2)
+ax.scatter(omni_df['mjd'], omni_df['U'], color='C0', marker='.', s=2, zorder=1,
+           label = 'OMNI Data')
+ax.scatter(X, Y, color='black', marker='.', s=2, zorder=2,
+           label="OMNI Data - ICMEs")
 # ax.scatter(X_clustered, Y_clustered, label='Inducing Points', color='C0', marker='o', s=6, zorder=4)
 
-ax.plot(Xo, Yo_mu, label="Mean prediction", color='C3', zorder=0)
+ax.plot(Xo, Yo_mu, label="Mean prediction", color='C1', zorder=0)
 ax.fill_between(
     Xo.ravel(),
     (Yo_mu - 1.96 * Yo_sig).ravel(),
     (Yo_mu + 1.96 * Yo_sig).ravel(),
-    alpha=0.1, color='C3',
+    alpha=0.5, color='C1',
     label=r"95% confidence interval", zorder=-2)
 
-for Fo in Fo_samples[0:2]:
-    ax.plot(Xo.ravel(), Fo.ravel(), lw=0.5, color='C5', alpha=0.75, zorder=1)
+for Fo in Fo_samples:
+    ax.plot(Xo.ravel(), Fo.ravel(), lw=1, color='C4', alpha=0.1, zorder=-1)
+ax.plot(Xo.ravel()[0:1], Fo.ravel()[0:1], lw=1, color='C4', alpha=1, 
+        label = 'Samples about Mean')
 
-ax.legend()
+ax.legend(scatterpoints=3)
 ax.set(xlabel='Date [MJD]', ylabel='Solar Wind Speed [km/s]', 
        title='OMNI (@ 1AU), no ICMEs, GP Data Imputation')
+# ax.set(xlim=[60425, 60450])
 
 
 # %% Backmap samples to 21.5 Rs, add CMEs =====================================
@@ -244,7 +255,7 @@ def map_omni_inwards(runstart, runstop, df):
     
     # Generate boundary conditions from omni dataframe
     time_omni, vcarr_omni, bcarr_omni = Hin.generate_vCarr_from_OMNI(runstart, runstop, omni_input=df)
-    
+    breakpoint()
     # Get the position of the Earth from JPL Horizons
     epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
                   'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
@@ -268,7 +279,7 @@ def map_omni_inwards(runstart, runstop, df):
         vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
                                                      210 * u.solRad,
                                                      21.5 * u.solRad)
-        
+        breakpoint()
     return time_omni, vcarr_21p5, bcarr_omni
 
 def create_CME_list(runstart, runstop):
@@ -304,41 +315,134 @@ import time
 
 t_start = time.time()
 time_21p5_control, vcarr_21p5_control, bcarr_21p5_control = map_omni_inwards(runstart, runstop, omni_df)
-
 print('Time backmapping: ', time.time() - t_start) # About 20s
-model = Hin.set_time_dependent_boundary(vcarr_21p5_control, time_21p5_control, 
+
+
+
+def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, **kwargs):
+    """
+    Run HUXt for a celestial body or spacecraft, computing the correct
+    longitudes to minimize runtime
+
+    Parameters
+    ----------
+    body : TYPE
+        DESCRIPTION.
+    **kwargs : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    body_id_dict = {'mercury': '199', 'venus': '299', 'earth': '399', 'mars': '499',
+                    'jupiter': '599', 'saturn': '699', 'uranus': '799', 'neptune': '899',
+                    'parker solar probe': '2018-065A', 'solar orbiter': '2020-010A',
+                    'stereo-a': '2006-047A', 'stereo-b': '2006-047B',
+                    'juno': '2011-040A'}
+    if body.lower() in body_id_dict.keys():
+        body_id = body_id_dict[body.lower()]
+    else:
+        print("This body is not currently supported. Supported bodies include:")
+        print(list(body_id_dict.keys()))
+    
+    # Get the position of the Earth from JPL Horizons
+    epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
+                  'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
+                  'step': '{:1.0f}d'.format(np.diff(time_grid).mean())}
+    
+    earth_pos = Horizons(id = '399', location = '@SSB', epochs = epoch_dict).vectors().to_pandas()
+    earth_pos['phi'] = np.arctan2(earth_pos['y'], earth_pos['x']) + np.pi 
+    earth_pos['lambda'] = np.arctan2(earth_pos['z'], np.sqrt(earth_pos['x']**2 + earth_pos['y']**2)) 
+    
+    body_pos = Horizons(id = body_id, location='@SSB', epochs = epoch_dict).vectors().to_pandas()
+    body_pos['phi'] = np.arctan2(body_pos['y'], body_pos['x']) + np.pi 
+    body_pos['lambda'] = np.arctan2(body_pos['z'], np.sqrt(body_pos['x']**2 + body_pos['y']**2))
+    
+    delta_phi = body_pos['phi'] - earth_pos['phi'][0]
+    start_lon = ((delta_phi.iloc[0] + 2*np.pi) % (2*np.pi)) * u.rad
+    stop_lon = ((delta_phi.iloc[-1] + 2*np.pi) % (2*np.pi)) * u.rad
+    
+    model = Hin.set_time_dependent_boundary(vgrid_Carr, time_grid, 
+                                            runstart, simtime = (runstop - runstart).days*u.day, 
+                                            lon_start = start_lon, 
+                                            lon_stop =  stop_lon,
+                                            frame='sidereal',
+                                            **kwargs)
+    
+    return model
+
+
+
+# Get the list of relevant CMEs, which won't change across samples
+cmelist = create_CME_list(runstart_padded, runstop_padded)
+
+
+
+model = HUXt_at('mars', runstart, runstop, 
+                time_grid = time_21p5_control, 
+                vgrid_Carr = vcarr_21p5_control, 
+                bgrid_Carr = bcarr_21p5_control, 
+                r_min = 21.5 * u.solRad, 
+                r_max = 2150 * u.solRad, 
+                latitude=0*u.deg)
+
+model.solve([])
+HA.animate(model, 'mars_nocme')
+
+# Now map each sample back
+time_samples, vcarr_samples, bcarr_samples = [], [], []
+for Fo in tqdm.tqdm(Fo_samples):
+    
+    # Create a version of omni_df with the sample in place of U
+    omni_df_sample = omni_df.copy(deep=True)
+    omni_df_sample['U'] = Fo.ravel()
+    
+    # Backmap
+    time, vcarr, bcarr = map_omni_inwards(runstart, runstop, omni_df_sample)
+    
+    time_samples.append(time)
+    vcarr_samples.append(vcarr)
+    bcarr_samples.append(bcarr)
+    
+    
+model = HUXt_at('mars', runstart, runstop, 
+                time_grid = time_samples[0], 
+                vgrid_Carr = vcarr_samples[0], 
+                bgrid_Carr = bcarr_samples[0], 
+                r_min = 21.5 * u.solRad, 
+                r_max = 2150 * u.solRad, 
+                latitude=0*u.deg)
+
+model.solve([cmelist])
+HA.animate(model, 'mars_cme_full')
+
+# # running for a single longitude takes ~28s
+# # running for 20 degrees longitude takes ~37s
+# # model_spans = [0,  10, 20, 30, 40, 50, 60, 70, 80, 90]
+# # model_takes = [28, 32, 37, 40, 46, 53, 59, 61, 67, 74]
+model = Hin.set_time_dependent_boundary(vcarr_samples[0], time_samples[0], 
                                         runstart, simtime = runtime.days*u.day, 
                                         r_min = 21.5 * u.solRad, 
                                         r_max = 2150 * u.solRad, 
                                         latitude=0*u.deg,
-                                        bgrid_Carr = bcarr_21p5_control, 
-                                        lon_start = (350 * u.deg).to(u.rad), 
-                                        lon_stop =  (10* u.deg).to(u.rad),
-                                        frame = 'sidereal')
-print('Time initializing model: ', time.time() - t_start) # About 26s
-model.solve([])
-print('Time solving model: ', time.time() - t_start)
+                                        bgrid_Carr = bcarr_samples[0], 
+                                        lon_start = 0 * u.rad, 
+                                        lon_stop =  360 * u.rad,
+                                        # lon_out = (0 * u.deg).to(u.rad),
+                                        frame='sidereal') # frame = 'sidereal')
+# print('Time initializing model: ', time.time() - t_start) # About 26s
+# model.solve([])
+# print('Time solving model: ', time.time() - t_start)
 
-# # Now map each sample back
-# time_samples, vcarr_samples, bcarr_samples = [], [], []
-# for Fo in tqdm.tqdm(Fo_samples):
-    
-#     # Create a version of omni_df with the sample in place of U
-#     omni_df_sample = omni_df.copy(deep=True)
-#     omni_df_sample['U'] = Fo.ravel()
-    
-#     # Backmap
-#     time, vcarr, bcarr = map_omni_inwards(runstart, runstop, omni_df_sample)
-    
-#     time_samples.append(time)
-#     vcarr_samples.append(vcarr)
-#     bcarr_samples.append(bcarr)
+
     
 # time_samples = np.array(time_samples)
 # vcarr_samples = np.array(vcarr_samples)
 # bcarr_samples = np.array(bcarr_samples)
 
 # # Get the list of relevant CMEs, which won't change across samples
-# cmelist = create_CME_list(runstart, runstop)
+# cmelist = create_CME_list(runstart_padded, runstop_padded)
     
 
