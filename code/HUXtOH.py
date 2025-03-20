@@ -14,6 +14,7 @@ import datetime
 import os
 import sys
 import tqdm
+import pandas as pd
 
 from sunpy.net import Fido
 from sunpy.net import attrs
@@ -45,9 +46,10 @@ runstop = datetime.datetime(2024, 6, 1)
 runtime = (runstop - runstart)
 
 
-def fetch_omni(starttime, endtime):
+def fetch_omni(starttime, stoptime):
     """
-    A function to grab and process the OMNI COHO1HR data using FIDO
+    A function to grab and process the most up-to-date OMNI data from 
+    COHOWeb directly
     
     Args:
         starttime : datetime for start of requested interval
@@ -57,26 +59,57 @@ def fetch_omni(starttime, endtime):
         omni: Dataframe of the OMNI timeseries
 
     """
-    trange = attrs.Time(starttime, endtime)
-    dataset = attrs.cdaweb.Dataset('OMNI_COHO1HR_MERGED_MAG_PLASMA')
-    result = Fido.search(trange, dataset)
-    downloaded_files = Fido.fetch(result, path='../Data/OMNI/')
-
-    # Import the OMNI data
-    omni = TimeSeries(downloaded_files, concatenate=True).to_dataframe()
-    omni = omni.rename(columns = {'ABS_B': 'B',
-                                  'V': 'U'})
+    # trange = attrs.Time(starttime, endtime)
+    # dataset = attrs.cdaweb.Dataset('OMNI_COHO1HR_MERGED_MAG_PLASMA')
+    # result = Fido.search(trange, dataset)
+    # downloaded_files = Fido.fetch(result, path='../Data/OMNI/')
     
-    # Set invalid data points to NaN
-    id_bad = omni['U'] == 9999.0
-    omni.loc[id_bad, 'U'] = np.NaN
+    # omni = TimeSeries(downloaded_files, concatenate=True).to_dataframe()
+    # omni = omni.rename(columns = {'ABS_B': 'B',
+    #                               'V': 'U'})
+    # # Set invalid data points to NaN
+    # id_bad = omni['U'] == 9999.0
+    # omni.loc[id_bad, 'U'] = np.NaN
+
+    
+    # Get the relevant URLs
+    skeleton_url = 'https://spdf.gsfc.nasa.gov/pub/data/omni/low_res_omni/omni_m{YYYY:4.0f}.dat'
+    years_covered = np.arange(starttime.year, stoptime.year+1, 1)
+    all_urls = [skeleton_url.format(YYYY=year) for year in years_covered]
+    
+    # Read each OMNI file, concatenate, and set NaNs 
+    null_values = {'year': None, 'doy': None, 'hour': None,
+                   'lat_hgi': 9999.9, 'lon_hgi': 9999.9, 
+                   'BR': 999.9, 'BT': 999.9, 'BN': 999.9, 'B': 999.9, 
+                   'U': 9999., 'U_theta': 999.9, 'U_phi': 999.9,
+                   'n': 999.9, 'T': 9999999.}
+    df_list = []
+    for url in all_urls:
+        df = pd.read_csv(url, header=0, sep='\s+', names=null_values.keys())
+        df_list.append(df)
+    df = pd.concat(df_list, axis='index') 
+    df = df.reset_index().sort_index()
+    for col, null_val in null_values.items():
+        null_index = df[col] == null_val
+        df.loc[null_index, col] = np.nan
+    
+    # Add datetime, MJD
+    parse_dt = datetime.datetime.strptime
+    date_cols = ['year', 'doy', 'hour']
+    str_fmt   = '{:04.0f}-{:03.0f} {:02.0f}'
+    dt_fmt    = '%Y-%j %H'
+    df['dt'] = [parse_dt(str_fmt.format(*row[date_cols]), dt_fmt) 
+                      for _, row in df.iterrows()]
+    df['mjd'] = Time(df['dt']).mjd
 
     # create a BX_GSE field that is expected by some HUXt fucntions
-    omni['BX_GSE'] = -omni['BR']
+    df['BX_GSE'] = -df['BR']
     
-    # add an mjd column too
-    omni['mjd'] = Time(omni.index).mjd
-
+    # Limit the dataframe to the requested dates
+    omni = df.query('@starttime <= dt < @stoptime')
+    omni = omni.rename(columns={'dt': 'datetime'})
+    omni.reset_index()
+    
     return omni
 
 # %% Get raw OMNI data ========================================================
