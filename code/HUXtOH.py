@@ -15,6 +15,7 @@ import os
 import sys
 import tqdm
 import pandas as pd
+import time
 
 from sunpy.net import Fido
 from sunpy.net import attrs
@@ -41,12 +42,12 @@ except:
 
 # HUXt can be easily initiated MAS, by specifying a carrington rotation number. 
 # Data are downloaded from the Pred Sci Inc archive on demand
-runstart = datetime.datetime(2024, 4, 1)
-runstop = datetime.datetime(2024, 6, 1)
+runstart = datetime.datetime(2024, 9, 1)
+runstop = datetime.datetime(2024, 11, 1)
 runtime = (runstop - runstart)
 
 
-def fetch_omni(starttime, stoptime):
+def lookup_omni(starttime, stoptime):
     """
     A function to grab and process the most up-to-date OMNI data from 
     COHOWeb directly
@@ -88,7 +89,7 @@ def fetch_omni(starttime, stoptime):
         df = pd.read_csv(url, header=0, sep='\s+', names=null_values.keys())
         df_list.append(df)
     df = pd.concat(df_list, axis='index') 
-    df = df.reset_index().sort_index()
+    df = df.reset_index(drop=True).sort_index()
     for col, null_val in null_values.items():
         null_index = df[col] == null_val
         df.loc[null_index, col] = np.nan
@@ -108,9 +109,68 @@ def fetch_omni(starttime, stoptime):
     # Limit the dataframe to the requested dates
     omni = df.query('@starttime <= dt < @stoptime')
     omni = omni.rename(columns={'dt': 'datetime'})
-    omni = omni.reset_index()
+    omni = omni.reset_index(drop=True)
     
     return omni
+
+def lookup_PSPData(starttime, stoptime):
+    """
+    A function to grab and process the most up-to-date PSP data from 
+    COHOWeb directly
+    
+    Args:
+        starttime : datetime for start of requested interval
+        endtime : datetime for start of requested interval
+
+    Returns:
+        
+
+    """
+
+    # Get the relevant URLs
+    skeleton_url = 'https://spdf.gsfc.nasa.gov/pub/data/psp/coho1hr_magplasma/ascii/psp_merged_hr{YYYY}.txt'
+    years_covered = np.arange(starttime.year, stoptime.year+1, 1)
+    all_urls = [skeleton_url.format(YYYY=year) for year in years_covered]
+    
+    # Read each OMNI file, concatenate, and set NaNs 
+    null_values = {'year': None, 'doy': None, 'hour': None,
+                   'r_hgi': 999.99, 'lat_hgi': 9999.9, 'lon_hgi': 9999.9,
+                   'BR': 99999.99, 'BT': 99999.99, 'BN': 99999.99, 'B': 99999.99, 
+                   'UR': 99999.9, 'UT': 99999.9, 'UN': 99999.9, 'U': 99999.9, 'U_theta': 99999.9, 'U_phi': 99999.9,
+                   'n': 9999.9, 'T': 99999999.}
+    df_list = []
+    for url in all_urls:
+        # Fail gracefully
+        try:
+            df = pd.read_csv(url, header=0, sep='\s+', names=null_values.keys())
+        except:
+            print("File {} is not available. Skipping...".format(skeleton_url))
+        df_list.append(df)
+    df = pd.concat(df_list, axis='index') 
+    df = df.reset_index(drop=True).sort_index()
+    for col, null_val in null_values.items():
+        null_index = df[col] == null_val
+        df.loc[null_index, col] = np.nan
+    
+    # Add datetime, MJD
+    parse_dt = datetime.datetime.strptime
+    date_cols = ['year', 'doy', 'hour']
+    str_fmt   = '{:04.0f}-{:03.0f} {:02.0f}'
+    dt_fmt    = '%Y-%j %H'
+    df['dt'] = [parse_dt(str_fmt.format(*row[date_cols]), dt_fmt) 
+                      for _, row in df.iterrows()]
+    df['mjd'] = Time(df['dt']).mjd
+
+    # create a BX_GSE field that is expected by some HUXt fucntions
+    df['BX_GSE'] = -df['BR']
+    
+    # Limit the dataframe to the requested dates
+    df = df.query('@starttime <= dt < @stoptime')
+    df = df.rename(columns={'dt': 'datetime'})
+    df = df.reset_index(drop=True)
+    
+    return df
+
 
 # %% Get raw OMNI data ========================================================
 # =============================================================================
@@ -118,7 +178,7 @@ def fetch_omni(starttime, stoptime):
 padding = datetime.timedelta(days=27)
 runstart_padded = runstart - padding
 runstop_padded = runstop + padding
-omni_df = fetch_omni(runstart_padded, runstop_padded)
+omni_df = lookup_omni(runstart_padded, runstop_padded)
 
 # %% Get DONKI ICMEs @ OMNI ===================================================
 # Assume a generous ICME duration
@@ -155,7 +215,7 @@ mid_l      = 0.05
 max_l      = 0.2
 init_var   = 3
 period = 27/(runtime.total_seconds() / (24*60*60)) * maxRescale
-n_samples = 10
+n_samples = 9
 
 X = qomni_df.dropna(axis='index', how='any')['mjd'].to_numpy('float64')[:, None]
 Y = qomni_df.dropna(axis='index', how='any')['U'].to_numpy('float64')[:, None]
@@ -274,47 +334,9 @@ ax.set(xlabel='Date [MJD]', ylabel='Solar Wind Speed [km/s]',
        title='OMNI (@ 1AU), no ICMEs, GP Data Imputation')
 # ax.set(xlim=[60425, 60450])
 
-
-# %% Backmap samples to 21.5 Rs, add CMEs =====================================
-# 
+# %% Get CMEs =================================================================
+# This only needs to be done once for the ensemble
 # =============================================================================
-
-def map_omni_inwards(runstart, runstop, df):
-    
-    # Format the OMNI DataFrame as HUXt expects it
-    df['V'] = df['U']
-    # df['datetime'] = df.index
-    # df = df.reset_index()
-    
-    # Generate boundary conditions from omni dataframe
-    time_omni, vcarr_omni, bcarr_omni = Hin.generate_vCarr_from_OMNI(runstart, runstop, omni_input=df)
-    
-    # Get the position of the Earth from JPL Horizons
-    epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
-                  'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
-                  'step': '{:1.0f}d'.format(np.diff(time_omni).mean())}
-    earth_pos = Horizons(id = '399', location = '500@0', epochs = epoch_dict).vectors().to_pandas()
-    
-    # Map to 210 solar radii, then 21.5 solar radii
-    vcarr_210 = vcarr_omni.copy()
-    vcarr_21p5 = vcarr_omni.copy()
-    for i, time in enumerate(time_omni):
-        
-        # Lookup the helicentric distance of the Earth
-        Earth_r_AU = (earth_pos['range'].iloc[i] * u.AU)
-        
-        # Map to 210 solar radii
-        vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr_omni[:,i]*u.km/u.s, 
-                                                    Earth_r_AU.to(u.solRad), 
-                                                    210 * u.solRad)
-        
-        # And map to 21.5 solar radii
-        vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
-                                                     210 * u.solRad,
-                                                     21.5 * u.solRad)
-        
-    return time_omni, vcarr_21p5, bcarr_omni
-
 def create_CME_list(runstart, runstop):
     
     # Get the CMEs
@@ -342,17 +364,91 @@ def create_CME_list(runstart, runstop):
             cmelist.append(cme)
             
     return cmelist
+
+def perturb_CME_list(cme_list, n):
+    import copy
+    
+    # Baby steps: just perturb the launch time and velocity
+    scales = {'tla': 3600,
+              'lon': 20,
+              'lat': 10,
+              'wid': 10,
+              'vel': 50,
+              'thi': 1}
+    
+    rng = np.random.default_rng()
+    
+    perturbed_cme_lists = []
+    for cme in cme_list:
+        t_launch_0 = cme.t_launch
+        v_0 = cme.v
         
-# Unmodified omni for comparison
-import time
+        t_launch_perturbed = rng.normal(t_launch_0.value, 3600., n) * t_launch_0.unit
+        v_perturbed = rng.normal(v_0.value, 50, n) * v_0.unit
+        
+        new_cmes = []
+        for i in range(n):
+            new_cme = copy.deepcopy(cme)
+            new_cme.t_lauch = t_launch_perturbed[i]
+            new_cme.v = v_perturbed[i]
+            new_cmes.append(new_cme)
+            
+        perturbed_cme_lists.append(new_cmes)
+    
+    perturbed_cme_lists = [list(l) for l in zip(*perturbed_cme_lists)]
+    
+    return perturbed_cme_lists
+    
+    
+# benchmark_cmelist = time.time()
+cmelist = create_CME_list(runstart_padded, runstop_padded)
+perturbed_cmelist = perturb_CME_list(cmelist, n_samples)
+# print(time.time() - benchmark_cmelist)
 
-t_start = time.time()
-time_21p5_control, vcarr_21p5_control, bcarr_21p5_control = map_omni_inwards(runstart, runstop, omni_df)
-print('Time backmapping: ', time.time() - t_start) # About 20s
+# !!!!! CHECK MODEL RUN TIME WITH DIFFERENT NUMBERS OF CMES (for same duration)
 
 
+# %% Backmap samples to 21.5 Rs ===============================================
+# 
+# =============================================================================
 
-def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, **kwargs):
+def map_omni_inwards(runstart, runstop, df):
+    
+    # Format the OMNI DataFrame as HUXt expects it
+    df['V'] = df['U']
+    # df['datetime'] = df.index
+    # df = df.reset_index()
+    
+    # Generate boundary conditions from omni dataframe
+    time_omni, vcarr_omni, bcarr_omni = Hin.generate_vCarr_from_OMNI(runstart, runstop, omni_input=df)
+    
+    # Get the position of the Earth from JPL Horizons
+    epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
+                  'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
+                  'step': '{:1.0f}d'.format(np.diff(time_omni).mean())}
+    earth_pos = Horizons(id = '399', location = '500@0', epochs = epoch_dict).vectors().to_pandas()
+    
+    # Map to 210 solar radii, then 21.5 solar radii
+    vcarr_210 = vcarr_omni.copy()
+    vcarr_21p5 = vcarr_omni.copy()
+    for i, t in enumerate(time_omni):
+        
+        # Lookup the helicentric distance of the Earth
+        Earth_r_AU = (earth_pos['range'].iloc[i] * u.AU)
+        
+        # Map to 210 solar radii
+        vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr_omni[:,i]*u.km/u.s, 
+                                                    Earth_r_AU.to(u.solRad), 
+                                                    210 * u.solRad)
+        
+        # And map to 21.5 solar radii
+        vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
+                                                     210 * u.solRad,
+                                                     21.5 * u.solRad)
+        
+    return time_omni, vcarr_21p5, bcarr_omni
+
+def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, **kwargs):
     """
     Run HUXt for a celestial body or spacecraft, computing the correct
     longitudes to minimize runtime
@@ -369,113 +465,142 @@ def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, **kwargs):
     None.
 
     """
-    body_id_dict = {'mercury': '199', 'venus': '299', 'earth': '399', 'mars': '499',
-                    'jupiter': '599', 'saturn': '699', 'uranus': '799', 'neptune': '899',
-                    'parker solar probe': '2018-065A', 'solar orbiter': '2020-010A',
-                    'stereo-a': '2006-047A', 'stereo-b': '2006-047B',
-                    'juno': '2011-040A'}
-    if body.lower() in body_id_dict.keys():
-        body_id = body_id_dict[body.lower()]
+    body_pos = H.Observer(body, Time(time_grid, format='mjd'))
+    
+    # HEEQ longitude, continuous
+    delta = np.unwrap(body_pos.lon.value)
+    if (delta > 2*np.pi).any():
+        delta -= 2*np.pi
+    
+    # Max and Min of delta
+    dmin, dmax = np.min(delta), np.max(delta)
+    if ((delta >= dmin) & (delta <= dmax)).all():
+        start_lon = (dmin - dpadding) % (2*np.pi)
+        stop_lon = (dmax + dpadding) % (2*np.pi)
+    elif ((delta >= dmax) | (delta <= dmin)).all():
+        start_lon = (dmax - dpadding) % (2*np.pi)
+        stop_lon = (dmin + dpadding) % (2*np.pi)
     else:
-        print("This body is not currently supported. Supported bodies include:")
-        print(list(body_id_dict.keys()))
+        print("Something fishy is afoot...")
+        breakpoint()
     
-    # Get the position of the Earth from JPL Horizons
-    epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
-                  'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
-                  'step': '{:1.0f}d'.format(np.diff(time_grid).mean())}
-    
-    earth_pos = Horizons(id = '399', location = '@SSB', epochs = epoch_dict).vectors().to_pandas()
-    earth_pos['phi'] = np.arctan2(earth_pos['y'], earth_pos['x']) + np.pi 
-    earth_pos['lambda'] = np.arctan2(earth_pos['z'], np.sqrt(earth_pos['x']**2 + earth_pos['y']**2)) 
-    
-    body_pos = Horizons(id = body_id, location='@SSB', epochs = epoch_dict).vectors().to_pandas()
-    body_pos['phi'] = np.arctan2(body_pos['y'], body_pos['x']) + np.pi 
-    body_pos['lambda'] = np.arctan2(body_pos['z'], np.sqrt(body_pos['x']**2 + body_pos['y']**2))
-    
-    delta_phi = body_pos['phi'] - earth_pos['phi'][0]
-    start_lon = ((delta_phi.iloc[0] + 2*np.pi) % (2*np.pi)) * u.rad
-    stop_lon = ((delta_phi.iloc[-1] + 2*np.pi) % (2*np.pi)) * u.rad
+    # # High res time grid, check that all points lie inside bounds...
+    # time_grid_hires = np.arange(time_grid[0], time_grid[-1], 0.01)
+    # body_pos_hires = H.Observer(body, Time(time_grid_hires, format='mjd'))
     
     model = Hin.set_time_dependent_boundary(vgrid_Carr, time_grid, 
                                             runstart, simtime = (runstop - runstart).days*u.day, 
-                                            lon_start = start_lon, 
-                                            lon_stop =  stop_lon,
-                                            frame='sidereal',
+                                            lon_start = start_lon * u.rad, 
+                                            lon_stop =  stop_lon * u.rad,
+                                            frame='synodic',
                                             **kwargs)
+   
+    return model
+
+# Now map each sample back
+time_samples, vcarr_samples, bcarr_samples = [], [], []
+results = []
+
+# Add speed samples to omni_df in a list
+omni_samples = []
+for i in range(n_samples):
+    
+    Fo = Fo_samples[i]
+    omni_df_sample = omni_df.copy(deep=True)
+    omni_df_sample['U'] = Fo.ravel()
+    omni_samples.append(omni_df_sample)
+    
+
+
+def solve_single_model(_runstart, _runstop, _omni_df, _cme_list):
+    
+    # Backmap
+    time, vcarr, bcarr = map_omni_inwards(_runstart, _runstop, _omni_df)
+    
+    # Propagate to PSP
+    model = HUXt_at('parker solar probe', _runstart, _runstop, 
+                    time_grid = time, 
+                    vgrid_Carr = vcarr, 
+                    bgrid_Carr = bcarr, 
+                    r_min = 21.5 * u.solRad, 
+                    r_max = 215 * u.solRad, 
+                    latitude=0*u.deg)
+    
+    model.solve(_cme_list)
     
     return model
 
 
+import dask
 
-# Get the list of relevant CMEs, which won't change across samples
-cmelist = create_CME_list(runstart_padded, runstop_padded)
+args = [(a, b, c, d) for a, b, c, d in zip([runstart]*n_samples, 
+                                            [runstop]*n_samples,
+                                            omni_samples,
+                                            perturbed_cmelist)]
 
 
-
-model = HUXt_at('mars', runstart, runstop, 
-                time_grid = time_21p5_control, 
-                vgrid_Carr = vcarr_21p5_control, 
-                bgrid_Carr = bcarr_21p5_control, 
-                r_min = 21.5 * u.solRad, 
-                r_max = 2150 * u.solRad, 
-                latitude=0*u.deg)
-
-model.solve([])
-HA.animate(model, 'mars_nocme')
-
-# Now map each sample back
-time_samples, vcarr_samples, bcarr_samples = [], [], []
-for Fo in tqdm.tqdm(Fo_samples):
+lazy_results = []
+for arg in args:
+    lazy_result = dask.delayed(solve_single_model)(*arg)
+    lazy_results.append(lazy_result)
     
-    # Create a version of omni_df with the sample in place of U
-    omni_df_sample = omni_df.copy(deep=True)
-    omni_df_sample['U'] = Fo.ravel()
-    
-    # Backmap
-    time, vcarr, bcarr = map_omni_inwards(runstart, runstop, omni_df_sample)
-    
-    time_samples.append(time)
-    vcarr_samples.append(vcarr)
-    bcarr_samples.append(bcarr)
-    
-    
-model = HUXt_at('mars', runstart, runstop, 
-                time_grid = time_samples[0], 
-                vgrid_Carr = vcarr_samples[0], 
-                bgrid_Carr = bcarr_samples[0], 
-                r_min = 21.5 * u.solRad, 
-                r_max = 2150 * u.solRad, 
-                latitude=0*u.deg)
+futures = dask.persist(*lazy_results) 
 
-model.solve([cmelist])
-HA.animate(model, 'mars_cme_full')
+results = dask.compute(*futures)
 
-# # running for a single longitude takes ~28s
-# # running for 20 degrees longitude takes ~37s
-# # model_spans = [0,  10, 20, 30, 40, 50, 60, 70, 80, 90]
-# # model_takes = [28, 32, 37, 40, 46, 53, 59, 61, 67, 74]
-model = Hin.set_time_dependent_boundary(vcarr_samples[0], time_samples[0], 
-                                        runstart, simtime = runtime.days*u.day, 
-                                        r_min = 21.5 * u.solRad, 
-                                        r_max = 2150 * u.solRad, 
-                                        latitude=0*u.deg,
-                                        bgrid_Carr = bcarr_samples[0], 
-                                        lon_start = 0 * u.rad, 
-                                        lon_stop =  360 * u.rad,
-                                        # lon_out = (0 * u.deg).to(u.rad),
-                                        frame='sidereal') # frame = 'sidereal')
-# print('Time initializing model: ', time.time() - t_start) # About 26s
-# model.solve([])
-# print('Time solving model: ', time.time() - t_start)
+# def worker(args):
+#     print("Working!")
+#     return solve_single_model(*args)
+
+# import multiprocessing as mp
+
+# if __name__ == "__main__":
+    
+#     args = [(a, b, c, d) for a, b, c, d in zip([runstart]*n_samples, 
+#                                                [runstop]*n_samples,
+#                                                omni_samples,
+#                                                perturbed_cmelist)]
+    
+#     cpus_available = mp.cpu_count()
+#     results = []
+#     with mp.Pool(cpus_available-1) as pool:
+#         generator = pool.imap(worker, args)
+
+#         for element in tqdm.tqdm(generator, total=len(args)):
+            
+#             results.append(element)
+#     print("Program finished!")
+
+# test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0])
 
 
-    
-# time_samples = np.array(time_samples)
-# vcarr_samples = np.array(vcarr_samples)
-# bcarr_samples = np.array(bcarr_samples)
+# # Plot PSP data
+# psp_data = lookup_PSPData(runstart, runstop)
 
-# # Get the list of relevant CMEs, which won't change across samples
-# cmelist = create_CME_list(runstart_padded, runstop_padded)
+# fig, ax = plt.subplots()
+# # ax.scatter(psp_data['mjd'], psp_data['U'], 
+# #            color='black', marker='x', lw=1.0, s=8,
+# #            label = 'PSP Measurements')
+# ax.plot(psp_data['mjd'], psp_data['U'], 
+#            color='black', lw=1.0,
+#            label = 'PSP Measurements')
+
+
+# for i, result in enumerate(results):
+#     body_ts = HA.get_observer_timeseries(result, 'PSP')
+#     ax.plot(body_ts['mjd'], body_ts['vsw'],
+#             color='C4', lw=1, alpha=0.33)
+#     if i == 0:
+#         ax.plot(body_ts['mjd'][0:1], body_ts['vsw'][0:1],
+#                 color='C4', lw=1, alpha=1,
+#                 label = 'bOMNI-HUXt Ensemble')
+# ax.plot()
     
+# ax.legend()
+    
+# ax.set(ylim = (200,800), ylabel="Solar Wind Flow Speed [km/s]",
+#        xlabel = "Date [MJD]")
+# plt.suptitle("bOMNI-HUXt @ Parker Solar Probe, ICME-subtracted, CME-added, GP data imputation")
+
+
 
