@@ -23,7 +23,8 @@ from sunpy.timeseries import TimeSeries
 from sunpy.coordinates import sun
 from astropy.time import Time
 
-sys.path.append('../HUXt/code/')
+sys.path.append('HUXt/code/')
+sys.path.append('code/')
 import huxt as H
 import huxt_analysis as HA
 import huxt_inputs as Hin
@@ -407,12 +408,16 @@ perturbed_cmelist = perturb_CME_list(cmelist, n_samples)
 
 # !!!!! CHECK MODEL RUN TIME WITH DIFFERENT NUMBERS OF CMES (for same duration)
 
+# %% Get Earth, Target Body Observer classes at 4h resolution
+times_for_pos = Time(omni_df['mjd'].to_numpy(), format='mjd')
+earth_pos = H.Observer('EARTH', times_for_pos)
+target_pos = H.Observer('PSP', times_for_pos)
 
 # %% Backmap samples to 21.5 Rs ===============================================
 # 
 # =============================================================================
 
-def map_omni_inwards(runstart, runstop, df):
+def map_omni_inwards(runstart, runstop, df, earth_pos = None):
     
     # Format the OMNI DataFrame as HUXt expects it
     df['V'] = df['U']
@@ -423,22 +428,19 @@ def map_omni_inwards(runstart, runstop, df):
     time_omni, vcarr_omni, bcarr_omni = Hin.generate_vCarr_from_OMNI(runstart, runstop, omni_input=df)
     
     # Get the position of the Earth from JPL Horizons
-    epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
-                  'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
-                  'step': '{:1.0f}d'.format(np.diff(time_omni).mean())}
-    earth_pos = Horizons(id = '399', location = '500@0', epochs = epoch_dict).vectors().to_pandas()
+    if earth_pos is None:
+        epoch_dict = {'start': runstart.strftime('%Y-%m-%d %H:%M:%S'), 
+                      'stop': runstop.strftime('%Y-%m-%d %H:%M:%S'), 
+                      'step': '{:1.0f}d'.format(np.diff(time_omni).mean())}
+        earth_pos = Horizons(id = '399', location = '500@0', epochs = epoch_dict).vectors().to_pandas()
     
     # Map to 210 solar radii, then 21.5 solar radii
     vcarr_210 = vcarr_omni.copy()
     vcarr_21p5 = vcarr_omni.copy()
     for i, t in enumerate(time_omni):
-        
-        # Lookup the helicentric distance of the Earth
-        Earth_r_AU = (earth_pos['range'].iloc[i] * u.AU)
-        
         # Map to 210 solar radii
         vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr_omni[:,i]*u.km/u.s, 
-                                                    Earth_r_AU.to(u.solRad), 
+                                                    earth_pos.r[i], 
                                                     210 * u.solRad)
         
         # And map to 21.5 solar radii
@@ -448,7 +450,7 @@ def map_omni_inwards(runstart, runstop, df):
         
     return time_omni, vcarr_21p5, bcarr_omni
 
-def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, **kwargs):
+def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, target_pos=None, **kwargs):
     """
     Run HUXt for a celestial body or spacecraft, computing the correct
     longitudes to minimize runtime
@@ -465,10 +467,11 @@ def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, **kwa
     None.
 
     """
-    body_pos = H.Observer(body, Time(time_grid, format='mjd'))
+    if target_pos is None:
+        target_pos = H.Observer(body, Time(time_grid, format='mjd'))
     
     # HEEQ longitude, continuous
-    delta = np.unwrap(body_pos.lon.value)
+    delta = np.unwrap(target_pos.lon.value)
     if (delta > 2*np.pi).any():
         delta -= 2*np.pi
     
@@ -497,6 +500,8 @@ def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, **kwa
    
     return model
 
+# %% 
+
 # Now map each sample back
 time_samples, vcarr_samples, bcarr_samples = [], [], []
 results = []
@@ -512,16 +517,17 @@ for i in range(n_samples):
     
 
 
-def solve_single_model(_runstart, _runstop, _omni_df, _cme_list):
+def solve_single_model(_runstart, _runstop, _omni_df, _cme_list, _earth_pos, _target_pos):
     
     # Backmap
-    time, vcarr, bcarr = map_omni_inwards(_runstart, _runstop, _omni_df)
+    time, vcarr, bcarr = map_omni_inwards(_runstart, _runstop, _omni_df, _earth_pos)
     
     # Propagate to PSP
     model = HUXt_at('parker solar probe', _runstart, _runstop, 
                     time_grid = time, 
                     vgrid_Carr = vcarr, 
                     bgrid_Carr = bcarr, 
+                    target_pos = _target_pos,
                     r_min = 21.5 * u.solRad, 
                     r_max = 215 * u.solRad, 
                     latitude=0*u.deg)
@@ -530,13 +536,43 @@ def solve_single_model(_runstart, _runstop, _omni_df, _cme_list):
     
     return model
 
+test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0], earth_pos, target_pos)
 
+# %% Multiprocess?
+args = [(a, b, c, d, e, f) for a, b, c, d, e, f in zip([runstart]*n_samples, 
+                                                       [runstop]*n_samples,
+                                                       omni_samples,
+                                                       perturbed_cmelist,
+                                                       [earth_pos]*n_samples,
+                                                       [target_pos]*n_samples)]
+
+import multiprocessing as mp
+
+def solve_single_model_star(arg):
+    return solve_single_model(*arg)
+
+n_cores = mp.cpu_count()-1
+with mp.Pool(n_cores) as pool:
+    generator = pool.imap(solve_single_model_star, )
+
+    for element in tqdm.tqdm(generator, total=len(data)):
+        splined_data.append(element)
+
+ #%%
 import dask
+from dask.diagnostics import ProgressBar
+import time as timer
+from dask.distributed import Client
 
-args = [(a, b, c, d) for a, b, c, d in zip([runstart]*n_samples, 
+client = Client(n_workers=2)
+
+t_start = timer.time()
+args = [(a, b, c, d, e, f) for a, b, c, d, e, f in zip([runstart]*n_samples, 
                                             [runstop]*n_samples,
                                             omni_samples,
-                                            perturbed_cmelist)]
+                                            perturbed_cmelist,
+                                            [earth_pos]*n_samples,
+                                            [target_pos]*n_samples)]
 
 
 lazy_results = []
@@ -544,9 +580,17 @@ for arg in args:
     lazy_result = dask.delayed(solve_single_model)(*arg)
     lazy_results.append(lazy_result)
     
-futures = dask.persist(*lazy_results) 
+print("Added to delayed queue in: ", timer.time()-t_start)
 
-results = dask.compute(*futures)
+# futures = dask.persist(*lazy_results) 
+
+# print("Persist step in: ", timer.time()-t_start)
+# %%
+with ProgressBar():
+    results = dask.compute(*lazy_results)
+    
+print("Finished in: ", timer.time()-t_start)
+# results = dask.compute(*futures)
 
 # def worker(args):
 #     print("Working!")
