@@ -23,8 +23,10 @@ from sunpy.timeseries import TimeSeries
 from sunpy.coordinates import sun
 from astropy.time import Time
 
-sys.path.append('HUXt/code/')
-sys.path.append('code/')
+sys.path.append('/Users/mrutala/projects/OHTransients/HUXt/code/')
+sys.path.append('/Users/mrutala/projects/OHTransients/code/')
+# os.environ['PYTHONPATH'] = '/Users/mrutala/projects/OHTransients/HUXt/code/'
+# os.environ['PYTHONPATH'] = '/Users/mrutala/projects/OHTransients/code/'
 import huxt as H
 import huxt_analysis as HA
 import huxt_inputs as Hin
@@ -41,13 +43,8 @@ try:
 except:
     pass
 
-# HUXt can be easily initiated MAS, by specifying a carrington rotation number. 
-# Data are downloaded from the Pred Sci Inc archive on demand
-runstart = datetime.datetime(2024, 9, 1)
-runstop = datetime.datetime(2024, 11, 1)
-runtime = (runstop - runstart)
-
-
+# %% Data Search ==============================================================
+# =============================================================================
 def lookup_omni(starttime, stoptime):
     """
     A function to grab and process the most up-to-date OMNI data from 
@@ -176,164 +173,175 @@ def lookup_PSPData(starttime, stoptime):
 # %% Get raw OMNI data ========================================================
 # =============================================================================
 # !!!! Padding should relate to propagation time to Jupiter/Saturn
-padding = datetime.timedelta(days=27)
-runstart_padded = runstart - padding
-runstop_padded = runstop + padding
-omni_df = lookup_omni(runstart_padded, runstop_padded)
 
-# %% Get DONKI ICMEs @ OMNI ===================================================
-# Assume a generous ICME duration
-# =============================================================================
-icme_df = queryDONKI.ICME(runstart_padded, runstop_padded, location='Earth', duration=2.0*u.day)
+# omni_df = lookup_omni(runstart_padded, runstop_padded)
 
-# %% OMNI - ICMEs =============================================================
-# 
-# =============================================================================
-# Reformat icme_df for subtraction
-_icme_df = icme_df.rename(columns = {'eventTime': 'Shock_time'})
-_icme_df['ICME_end'] = [row['Shock_time'] + datetime.timedelta(days=(row['duration'])) for _, row in _icme_df.iterrows()]
+# # %% Get DONKI ICMEs @ OMNI ===================================================
+# # Assume a generous ICME duration
+# # =============================================================================
+# icme_df = queryDONKI.ICME(runstart_padded, runstop_padded, location='Earth', duration=2.0*u.day)
 
-qomni_df = Hin.remove_ICMEs(omni_df, _icme_df, interpolate=False, icme_buffer=0.5 * u.day, interp_buffer=1 * u.day,
-                            params=['U', 'BX_GSE'], fill_vals=None)
+# # %% OMNI - ICMEs =============================================================
+# # 
+# # =============================================================================
+# # Reformat icme_df for subtraction
+# _icme_df = icme_df.rename(columns = {'eventTime': 'Shock_time'})
+# _icme_df['ICME_end'] = [row['Shock_time'] + datetime.timedelta(days=(row['duration'])) for _, row in _icme_df.iterrows()]
 
-qomni_df['carringtonLongitude'] = sun.L0(qomni_df['datetime']).to(u.deg).value
+# qomni_df = Hin.remove_ICMEs(omni_df, _icme_df, interpolate=False, icme_buffer=0.5 * u.day, interp_buffer=1 * u.day,
+#                             params=['U', 'BX_GSE'], fill_vals=None)
+
+# qomni_df['carringtonLongitude'] = sun.L0(qomni_df['datetime']).to(u.deg).value
 
 # %% Gaussian Process Data Imputation =========================================
-# 
 # =============================================================================
+def make_BackgroundSolarWind_withGP(start, stop, n_samples, omni = None, icmes = None):
+    from sklearn.preprocessing import StandardScaler, MinMaxScaler
+    # from scipy.spatial.distance import cdist
+    # import tensorflow_probability  as     tfp
+    import gpflow
+    from sklearn.cluster import KMeans
+    
+    # These values are currently FIXED
+    # They may (should) be made adjustable
+    icme_duration = 2.0 * u.day # Seems reasonable from C&R ICME List
+    icme_buffer = 0.1 * u.day
+    interp_buffer = 1 * u.day
+    
+    max_mjd_scale = 100 # mjd will be rescaled between [0, max_mjd_scale]
+    subsetSize = 1000
+    min_l      = 0.0 
+    mid_l      = 0.05
+    max_l      = 0.2
+    init_var   = 3
+    period = 27 * u.day
+    # n_samples = 9
+    average_cluster_span = 6 * u.hour # For K-means clustering to reduce data 
+    
+    # Calculate the span from stop - start
+    span = stop - start
+    
+    # If no omni dataset is supplied, look one up
+    if omni is None:
+        omni = lookup_omni(start, stop)
+    
+    # If no icmes are supplied, look them up
+    if icmes is None:
+        icmes = queryDONKI.ICME(start, stop, location = 'Earth', duration = icme_duration)
+    
+    # Remove ICMEs from OMNI data, leaving NaNs behind
+    if 'eventTime' in icmes.columns: 
+        icmes = icmes.rename(columns = {'eventTime': 'Shock_time'})
+        icmes['ICME_end'] = [row['Shock_time'] + datetime.timedelta(days=(row['duration'])) for _, row in icmes.iterrows()]
+    
+    omni_noicme = Hin.remove_ICMEs(omni, icmes, 
+                                   params=['U', 'BX_GSE'], 
+                                   interpolate = False, 
+                                   icme_buffer = icme_buffer, 
+                                   interp_buffer = interp_buffer, 
+                                   fill_vals = np.nan)
+    
+    # Get the mjd and U as column vectors for GPflow
+    mjd = omni_noicme.dropna(axis='index', how='any')['mjd'].to_numpy()[:, None]
+    speed = omni_noicme.dropna(axis='index', how='any')['U'].to_numpy('float64')[:, None]
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-# from scipy.spatial.distance import cdist
-# import tensorflow_probability  as     tfp
-import gpflow
-from sklearn.cluster import KMeans
+    # Scale the MJD (abscissa) and U (ordinate) for GP imputation
+    mjd_rescaler = MinMaxScaler((0, max_mjd_scale))
+    mjd_rescaler.fit(mjd)
+    X = mjd_rescaler.transform(mjd)
 
-#set global variable scaling constants for GP
-maxRescale = 100
-subsetSize = 1000
-min_l      = 0.0 
-mid_l      = 0.05
-max_l      = 0.2
-init_var   = 3
-period = 27/(runtime.total_seconds() / (24*60*60)) * maxRescale
-n_samples = 9
+    speed_rescaler = StandardScaler()
+    speed_rescaler.fit(speed)
+    Y = speed_rescaler.transform(speed)
 
-X = qomni_df.dropna(axis='index', how='any')['mjd'].to_numpy('float64')[:, None]
-Y = qomni_df.dropna(axis='index', how='any')['U'].to_numpy('float64')[:, None]
+    # K-means cluster the data (fewer data = faster processing)
+    # And calculate the variance within each cluster
+    XY = np.array(list(zip(X.flatten(), Y.flatten())))
+    n_clusters = int((span.total_seconds()/3600) * u.hour / average_cluster_span)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY)
+    XYc = kmeans.cluster_centers_
+    Yc_var = np.array([np.var(XY[kmeans.labels_ == i, 1]) 
+                       for i in range(kmeans.n_clusters)])
 
-time_rescaler = MinMaxScaler((0, maxRescale))
-time_rescaler.fit(X)
-X_scaled = time_rescaler.transform(X)
+    # Arrange clusters to be strictly increasing in time (X)
+    Xc, Yc = XYc.T[0], XYc.T[1]
+    cluster_sort = np.argsort(Xc)
+    Xc = Xc[cluster_sort][:, None]
+    Yc = Yc[cluster_sort][:, None]
+    Yc_var = Yc_var[cluster_sort][:, None]
 
-val_rescaler = StandardScaler()
-val_rescaler.fit(Y)
-Y_scaled = val_rescaler.transform(Y)
+    # Construct the signal kernel for GP
+    # Again, these lengthscales could probable be calculated?
+    small_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=1.0)
+    large_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=10.0)
+    irregularities_kernel = gpflow.kernels.SquaredExponential(variance=1**2, lengthscales=1.0)
+    # Fixed period Carrington rotation kernel
+    period_rescaled = max_mjd_scale / (span.days * u.day / period).value
+    carrington_kernel = gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(), 
+                                                period=gpflow.Parameter(period_rescaled, trainable=False))
 
-# Simplify
-
-XY_scaled = np.array(list(zip(X_scaled.flatten(), Y_scaled.flatten())))
-n_clusters = int((runtime.total_seconds()/3600) / 6)
-kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_scaled)
-XY_clustered = kmeans.cluster_centers_
-
-X_clustered, Y_clustered = XY_clustered.T[0], XY_clustered.T[1]
-cluster_sort = np.argsort(X_clustered)
-X_clustered = X_clustered[cluster_sort][:, None]
-Y_clustered = Y_clustered[cluster_sort][:, None]
-
-# =============================================================================
-# scipy GP stuff, no longer used
-# =============================================================================
-# long_term_kernel = 2.0**2 * RBF(length_scale=1.0)
-# # short_term_kernel = 1.0**2 * RBF(length_scale=0.1)
-# irregularities_kernel = 0.5**2 * RationalQuadratic(length_scale=0.1, alpha=1.0)
-# carrington_kernel = (1.0**2 * RBF(length_scale=10.0) * ExpSineSquared(length_scale=1.0, periodicity=period, periodicity_bounds="fixed")
-# )
-# kernel = long_term_kernel + irregularities_kernel + carrington_kernel
-# # kernel = 1 * RBF(length_scale=0.1, length_scale_bounds=(1e-3, 1e1))
-# gaussian_process = GaussianProcessRegressor(kernel=kernel, alpha=1**2, n_restarts_optimizer=9)
-# gaussian_process.fit(X_clustered, Y_clustered)
-# gaussian_process.kernel_
-# Xp = np.arange(qomni_df['mjd'].iloc[0], qomni_df['mjd'].iloc[-1], 1/24.)[:, None]
-# Xp_scaled = time_rescaler.transform(Xp)
-# mean_prediction, std_prediction = gaussian_process.predict(Xp_scaled, return_std=True)
-# fig, ax = plt.subplots()
-# ax.scatter(X_scaled, Y_scaled, label="Observations", color='black', marker='.', s=2)
-# ax.scatter(X_clustered, Y_clustered, label='Inducing Points', color='C0', marker='o', s=6)
-# ax.plot(Xp_scaled, mean_prediction, label="Mean prediction", color='C3')
-# ax.fill_between(
-#     Xp_scaled.ravel(),
-#     mean_prediction - 1.96 * std_prediction,
-#     mean_prediction + 1.96 * std_prediction,
-#     alpha=0.5, color='C3',
-#     label=r"95% confidence interval",
-# )
-# ax.legend()
-# # ax.xlabel("$x$")
-# # ax.ylabel("$f(x)$")
-# # _ = plt.title("Gaussian process regression on noise-free dataset")
-# ax.set(xlim=[40,60])
-
-# =============================================================================
-# GPFlow GP stuff
-# =============================================================================
-# signal_kernel = gpflow.kernels.RationalQuadratic(variance = init_var)
-small_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=1.0)
-large_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=10.0)
-irregularities_kernel = gpflow.kernels.SquaredExponential(variance=1**2, lengthscales=1.0)
-carrington_kernel = gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(), period=period)
-
-signal_kernel = small_scale_kernel + large_scale_kernel + irregularities_kernel + carrington_kernel
-
-# model = gpflow.models.GPR((X_clustered, Y_clustered), kernel=signal_kernel)
-# !!!! Calculate noise_variance from clustered data
-model = gpflow.models.GPR((X_clustered, Y_clustered), kernel=signal_kernel, noise_variance=0.3)
-
-opt = gpflow.optimizers.Scipy()
-opt.minimize(model.training_loss, model.trainable_variables)
-
-# gpflow.utilities.print_summary(model)
-
-# Xp = np.arange(qomni_df['mjd'].iloc[0], qomni_df['mjd'].iloc[-1]+30, 1)[:, None]
-Xp = qomni_df['mjd'].to_numpy('float64')[:, None]
-Xp_scaled = time_rescaler.transform(Xp)
-
-Yp_scaled_mean, Yp_scaled_var = model.predict_y(Xp_scaled)
-Yp_scaled_mean, Yp_scaled_var = np.array(Yp_scaled_mean), np.array(Yp_scaled_var)
-Yp_scaled_std = np.sqrt(Yp_scaled_var)
-
-f_scaled_samples = model.predict_f_samples(Xp_scaled, n_samples, full_cov=False)
-f_scaled_samples = np.array(f_scaled_samples)
-
-Xo = time_rescaler.inverse_transform(Xp_scaled)
-Yo_mu = val_rescaler.inverse_transform(Yp_scaled_mean)
-Yo_sig = Yp_scaled_std * val_rescaler.scale_
-Fo_samples = np.array([val_rescaler.inverse_transform(f) for f in f_scaled_samples])
-
-fig, ax = plt.subplots()
-ax.scatter(omni_df['mjd'], omni_df['U'], color='C0', marker='.', s=2, zorder=1,
-           label = 'OMNI Data')
-ax.scatter(X, Y, color='black', marker='.', s=2, zorder=2,
-           label="OMNI Data - ICMEs")
-# ax.scatter(X_clustered, Y_clustered, label='Inducing Points', color='C0', marker='o', s=6, zorder=4)
-
-ax.plot(Xo, Yo_mu, label="Mean prediction", color='C1', zorder=0)
-ax.fill_between(
-    Xo.ravel(),
-    (Yo_mu - 1.96 * Yo_sig).ravel(),
-    (Yo_mu + 1.96 * Yo_sig).ravel(),
-    alpha=0.5, color='C1',
-    label=r"95% confidence interval", zorder=-2)
-
-for Fo in Fo_samples:
-    ax.plot(Xo.ravel(), Fo.ravel(), lw=1, color='C4', alpha=0.1, zorder=-1)
-ax.plot(Xo.ravel()[0:1], Fo.ravel()[0:1], lw=1, color='C4', alpha=1, 
-        label = 'Samples about Mean')
-
-ax.legend(scatterpoints=3)
-ax.set(xlabel='Date [MJD]', ylabel='Solar Wind Speed [km/s]', 
-       title='OMNI (@ 1AU), no ICMEs, GP Data Imputation')
-# ax.set(xlim=[60425, 60450])
+    signal_kernel = small_scale_kernel + large_scale_kernel + irregularities_kernel + carrington_kernel
+    
+    # This model *could* be solved with the exact noise for each point...
+    # But this would require defining a custom likelihood class...
+    model = gpflow.models.GPR((Xc, Yc), kernel=signal_kernel, noise_variance=np.mean(Yc_var))
+    
+    opt = gpflow.optimizers.Scipy()
+    opt.minimize(model.training_loss, model.trainable_variables)
+    
+    # gpflow.utilities.print_summary(model)
+    
+    # breakpoint()
+    
+    # Xp = np.arange(qomni_df['mjd'].iloc[0], qomni_df['mjd'].iloc[-1]+30, 1)[:, None]
+    Xo = omni['mjd'].to_numpy('float64')[:, None]
+    Xoc = mjd_rescaler.transform(Xo)
+    
+    Yoc_mu, Yoc_var = model.predict_y(Xoc)
+    Yoc_mu, Yoc_var = np.array(Yoc_mu), np.array(Yoc_var)
+    Yoc_sig = np.sqrt(Yoc_var)
+    
+    foc = model.predict_f_samples(Xoc, n_samples, full_cov=False)
+    foc = np.array(foc)
+    
+    Xo = mjd_rescaler.inverse_transform(Xoc)
+    Yo_mu = speed_rescaler.inverse_transform(Yoc_mu)
+    Yo_sig = Yoc_sig * speed_rescaler.scale_
+    fo_samples = np.array([speed_rescaler.inverse_transform(f) for f in foc])
+    
+    fig, ax = plt.subplots()
+    ax.scatter(omni['mjd'], omni['U'], color='C0', marker='.', s=2, zorder=1,
+               label = 'OMNI Data')
+    ax.scatter(omni_noicme['mjd'], omni_noicme['U'], color='black', marker='.', s=2, zorder=2,
+               label="OMNI Data - ICMEs")
+    # ax.scatter(Xc, Yc, label='Inducing Points', color='C1', marker='o', s=6, zorder=4)
+    
+    ax.plot(Xo, Yo_mu, label="Mean prediction", color='C5', zorder=0)
+    ax.fill_between(
+        Xo.ravel(),
+        (Yo_mu - 1.96 * Yo_sig).ravel(),
+        (Yo_mu + 1.96 * Yo_sig).ravel(),
+        alpha=0.5, color='C1',
+        label=r"95% confidence interval", zorder=-2)
+    
+    for fo_sample in fo_samples:
+        ax.plot(Xo.ravel(), fo_sample.ravel(), lw=1, color='C4', alpha=0.1, zorder=-1)
+    ax.plot(Xo.ravel()[0:1], fo_sample.ravel()[0:1], lw=1, color='C4', alpha=1, 
+            label = 'Samples about Mean')
+    
+    ax.legend(scatterpoints=3)
+    ax.set(xlabel='Date [MJD]', ylabel='Solar Wind Speed [km/s]', 
+           title='OMNI (@ 1AU), no ICMEs, GP Data Imputation')
+    # ax.set(xlim=[60425, 60450])
+    
+    # Add samples to omni, return as a list
+    results = []
+    for fo_sample in fo_samples:
+        new_omni = omni_noicme.copy(deep=True)
+        new_omni['U'] = fo_sample
+        results.append(new_omni)
+    
+    return results
 
 # %% Get CMEs =================================================================
 # This only needs to be done once for the ensemble
@@ -384,8 +392,8 @@ def perturb_CME_list(cme_list, n):
         t_launch_0 = cme.t_launch
         v_0 = cme.v
         
-        t_launch_perturbed = rng.normal(t_launch_0.value, 3600., n) * t_launch_0.unit
-        v_perturbed = rng.normal(v_0.value, 50, n) * v_0.unit
+        t_launch_perturbed = rng.normal(t_launch_0.value, 12*3600., n) * t_launch_0.unit
+        v_perturbed = rng.normal(v_0.value, 100, n) * v_0.unit
         
         new_cmes = []
         for i in range(n):
@@ -400,21 +408,8 @@ def perturb_CME_list(cme_list, n):
     
     return perturbed_cme_lists
     
-    
-# benchmark_cmelist = time.time()
-cmelist = create_CME_list(runstart_padded, runstop_padded)
-perturbed_cmelist = perturb_CME_list(cmelist, n_samples)
-# print(time.time() - benchmark_cmelist)
-
-# !!!!! CHECK MODEL RUN TIME WITH DIFFERENT NUMBERS OF CMES (for same duration)
-
-# %% Get Earth, Target Body Observer classes at 4h resolution
-times_for_pos = Time(omni_df['mjd'].to_numpy(), format='mjd')
-earth_pos = H.Observer('EARTH', times_for_pos)
-target_pos = H.Observer('PSP', times_for_pos)
 
 # %% Backmap samples to 21.5 Rs ===============================================
-# 
 # =============================================================================
 
 def map_omni_inwards(runstart, runstop, df, earth_pos = None):
@@ -467,6 +462,7 @@ def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, targe
     None.
 
     """
+    
     if target_pos is None:
         target_pos = H.Observer(body, Time(time_grid, format='mjd'))
     
@@ -502,18 +498,18 @@ def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, targe
 
 # %% 
 
-# Now map each sample back
-time_samples, vcarr_samples, bcarr_samples = [], [], []
-results = []
+# # Now map each sample back
+# time_samples, vcarr_samples, bcarr_samples = [], [], []
+# results = []
 
-# Add speed samples to omni_df in a list
-omni_samples = []
-for i in range(n_samples):
+# # Add speed samples to omni_df in a list
+# omni_samples = []
+# for i in range(n_samples):
     
-    Fo = Fo_samples[i]
-    omni_df_sample = omni_df.copy(deep=True)
-    omni_df_sample['U'] = Fo.ravel()
-    omni_samples.append(omni_df_sample)
+#     Fo = Fo_samples[i]
+#     omni_df_sample = omni_df.copy(deep=True)
+#     omni_df_sample['U'] = Fo.ravel()
+#     omni_samples.append(omni_df_sample)
     
 
 
@@ -536,115 +532,379 @@ def solve_single_model(_runstart, _runstop, _omni_df, _cme_list, _earth_pos, _ta
     
     return model
 
-test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0], earth_pos, target_pos)
+# test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0], earth_pos, target_pos)
+# %% Single processing
+
+
+
+# single_result = solve_single_model(runstart_padded, runstop_padded, omni_samples[0], cme_samples[0], earth_pos, target_pos)
+
+
+# t_start = timer.time()
+# results = []
+# for i in range(len(omni_samples)):
+#     print(i)
+#     r = solve_single_model(runstart_padded, runstop_padded, omni_samples[i], cme_samples[i], earth_pos, target_pos)
+#     results.append(r)
+# print(timer.time() - t_start)
+
+# psp = lookup_PSPData(runstart, runstop)
+# samples_psp = []
+# for r in results:
+#     sample = HA.get_observer_timeseries(r, 'PSP')
+#     samples_psp.append(sample)
+    
+# fig, ax = plt.subplots()
+# ax.scatter(psp['mjd'], psp['U'], color='black', marker='.', s=2, zorder=1,
+#            label = 'PSP Data')
+
+# mean_U = np.zeros(len(samples_psp[0]['vsw']))
+# for sample in samples_psp:
+#     ax.plot(sample['mjd'], sample['vsw'], color='C4', alpha=0.2, lw=1, zorder=-1)
+#     mean_U += sample['vsw']
+# ax.plot(sample['mjd'][0:1], sample['vsw'][0:1], color='C4', alpha=1, lw=1, label='bOMNI-HUXt Samples')
+# ax.plot(sample['mjd'], mean_U/n_samples, color='C5', alpha=1, lw=1, zorder=0, label='Mean bOMNI-HUXt')
+
+# ax.legend(scatterpoints=3)
+# ax.set(xlabel='Date [MJD]', ylabel='Solar Wind Speed [km/s]', 
+#        title='Ensemble Forecast for PSP, w/ Variable Background and CMEs')
+# ax.set(xlim = [psp['mjd'].iloc[0], psp['mjd'].iloc[-1]])
 
 # %% Multiprocess?
-args = [(a, b, c, d, e, f) for a, b, c, d, e, f in zip([runstart]*n_samples, 
-                                                       [runstop]*n_samples,
-                                                       omni_samples,
-                                                       perturbed_cmelist,
-                                                       [earth_pos]*n_samples,
-                                                       [target_pos]*n_samples)]
-
-import multiprocessing as mp
-
-def solve_single_model_star(arg):
-    return solve_single_model(*arg)
-
-n_cores = mp.cpu_count()-1
-with mp.Pool(n_cores) as pool:
-    generator = pool.imap(solve_single_model_star, )
-
-    for element in tqdm.tqdm(generator, total=len(data)):
-        splined_data.append(element)
-
- #%%
-import dask
-from dask.diagnostics import ProgressBar
-import time as timer
-from dask.distributed import Client
-
-client = Client(n_workers=2)
-
-t_start = timer.time()
-args = [(a, b, c, d, e, f) for a, b, c, d, e, f in zip([runstart]*n_samples, 
-                                            [runstop]*n_samples,
-                                            omni_samples,
-                                            perturbed_cmelist,
-                                            [earth_pos]*n_samples,
-                                            [target_pos]*n_samples)]
-
-
-lazy_results = []
-for arg in args:
-    lazy_result = dask.delayed(solve_single_model)(*arg)
-    lazy_results.append(lazy_result)
-    
-print("Added to delayed queue in: ", timer.time()-t_start)
-
-# futures = dask.persist(*lazy_results) 
-
-# print("Persist step in: ", timer.time()-t_start)
-# %%
-with ProgressBar():
-    results = dask.compute(*lazy_results)
-    
-print("Finished in: ", timer.time()-t_start)
-# results = dask.compute(*futures)
-
-# def worker(args):
-#     print("Working!")
-#     return solve_single_model(*args)
+# args = [(a, b, c, d, e, f) for a, b, c, d, e, f in zip([runstart]*n_samples, 
+#                                                        [runstop]*n_samples,
+#                                                        omni_samples,
+#                                                        perturbed_cmelist,
+#                                                        [earth_pos]*n_samples,
+#                                                        [target_pos]*n_samples)]
 
 # import multiprocessing as mp
 
-# if __name__ == "__main__":
-    
-#     args = [(a, b, c, d) for a, b, c, d in zip([runstart]*n_samples, 
-#                                                [runstop]*n_samples,
-#                                                omni_samples,
-#                                                perturbed_cmelist)]
-    
-#     cpus_available = mp.cpu_count()
-#     results = []
-#     with mp.Pool(cpus_available-1) as pool:
-#         generator = pool.imap(worker, args)
+# def solve_single_model_star(arg):
+#     return solve_single_model(*arg)
 
-#         for element in tqdm.tqdm(generator, total=len(args)):
+# n_cores = mp.cpu_count()-1
+# results = []
+# with mp.Pool(n_cores) as pool:
+#     generator = pool.imap(solve_single_model_star, args)
+
+#     for element in tqdm.tqdm(generator, total=len(args)):
+#         results.append(element)
+
+# # %% Multiprocess with Ray
+# import ray
+# import time
+# import huxt
+# import huxt_inputs
+# # os.environ['PYTHONPATH'] = '/Users/mrutala/projects/OHTransients/HUXt/code/'
+# # os.environ['PYTHONPATH'] = '/Users/mrutala/projects/OHTransients/code/'
+# # import huxt as H
+# # import huxt_inputs as Hin
+
+# runtime_env = {"working_dir": "/Users/mrutala/projects/OHTransients/HUXt/code/",
+#                "py_modules": ["/Users/mrutala/projects/OHTransients/HUXt/code/huxt.py",
+#                               "/Users/mrutala/projects/OHTransients/HUXt/code/huxt_inputs.py"]}
+# ray.init(runtime_env = runtime_env)
+
+# # ray.init(num_cpus=4)
+# @ray.remote
+# def backmap_withray(start, stop, omni_sample, earth_obs):
+    
+#     # Format the OMNI DataFrame as HUXt expects it
+#     omni_sample['V'] = omni_sample['U']
+    
+#     # Generate boundary conditions from omni dataframe
+#     time_omni, vcarr_omni, bcarr_omni = huxt_inputs.generate_vCarr_from_OMNI(start,stop, omni_input=omni_sample)
+    
+#     # Map to 210 solar radii, then 21.5 solar radii
+#     vcarr_210 = vcarr_omni.copy()
+#     vcarr_21p5 = vcarr_omni.copy()
+#     for i, t in enumerate(time_omni):
+#         # Map to 210 solar radii
+#         vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr_omni[:,i]*u.km/u.s, 
+#                                                     earth_obs.r[i], 
+#                                                     210 * u.solRad)
+        
+#         # And map to 21.5 solar radii
+#         vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
+#                                                      210 * u.solRad,
+#                                                      21.5 * u.solRad)
+    
+#     return time_omni, vcarr_21p5, bcarr_omni
+
+# futures = [backmap_withray.remote(runstart_padded, runstop_padded, sample, earth_pos) for sample in omni_samples]
+
+# t_start = time.time()
+# results = ray.get(futures)
+# print(time.time() - t_start)
+
+# # future = backmap_and_solve.remote(start = runstart_padded, 
+# #                                   stop = runstop_padded,
+# #                                   omni_samples = omni_samples,
+# #                                   cme_samples = cme_samples,
+# #                                   earth_state = earth_pos,
+# #                                   target_state = target_pos)
+
+# # results = ray.get(future)
+
+#%% Multiprocess with Dask: Setup
+import dask
+import time
+
+def print_url(filename, url):
+    with open(filename, 'w') as f:
+        print('<html>', file=f)
+        print(' <body>', file=f)
+        print('  <script type="text/javascript">', file=f)
+        print('   window.location.href = "{}"'.format(url), file=f)
+        print('  </script>', file=f)
+        print(' </body>', file=f)
+        print('</html>', file=f)
+    return
+
+@dask.delayed(nout=3)
+def _backmap(start, stop, omni_sample, earth_pos):
+    import sys
+    sys.path.append('/Users/mrutala/projects/OHTransients/HUXt/code/')
+    import huxt_inputs as Hin
+    
+    # Format the OMNI DataFrame as HUXt expects it
+    omni_sample['V'] = omni_sample['U']
+    
+    # Generate boundary conditions from omni dataframe
+    time_omni, vcarr_omni, bcarr_omni = Hin.generate_vCarr_from_OMNI(start, stop, omni_input=omni_sample)
+    
+    # Map to 210 solar radii, then 21.5 solar radii
+    vcarr_210 = vcarr_omni.copy()
+    vcarr_21p5 = vcarr_omni.copy()
+    for i, t in enumerate(time_omni):
+        # Map to 210 solar radii
+        vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr_omni[:,i]*u.km/u.s, 
+                                                    earth_pos.r[i], 
+                                                    210 * u.solRad)
+        
+        # And map to 21.5 solar radii
+        vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
+                                                     210 * u.solRad,
+                                                     21.5 * u.solRad)
+        
+    return time_omni, vcarr_21p5, bcarr_omni
+
+def backmap(start, stop, omni_samples, earth_pos):
+    import multiprocessing as mp
+    from dask.distributed import Client
+    
+    # Determine number of cores to use
+    num_cores = 4# int(0.75 * mp.cpu_count())
+    
+    # Create a client with explicit configuration
+    client = Client(
+        n_workers = num_cores, 
+        threads_per_worker = 1,  # Recommended for Spyder
+        processes = True  # Use multiprocessing
+        )
+       
+    # Write the dashboard link
+    print_url('backmap_url.html', client.dashboard_link)
+    
+    # Create delayed futures
+    futures = [_backmap(start, stop, s, earth_pos) 
+               for s in omni_samples]
+    
+    # Compute with multiple workers
+    results = dask.compute(*futures)
+    
+
+    client.close()
+    
+    return results
+        
+
+@dask.delayed(nout=1)
+def _dask_propagate_totarget(start, stop, target_obs, t_grid, vc_grid, bc_grid, cme_sample, dpadding=0.03, **kwargs):
+    import sys
+    sys.path.append('/Users/mrutala/projects/OHTransients/HUXt/code/')
+    import huxt_inputs as Hin
+    import huxt as H
+    import huxt_analysis as HA
+    
+    # Isolate the range of HEEQ longitudes covered by the target
+    # HEEQ longitude, continuous
+    delta = np.unwrap(target_obs.lon.value)
+    if (delta > 2*np.pi).any():
+        delta -= 2*np.pi
+    
+    # Max and Min of delta
+    dmin, dmax = np.min(delta), np.max(delta)
+    if ((delta >= dmin) & (delta <= dmax)).all():
+        start_lon = (dmin - dpadding) % (2*np.pi)
+        stop_lon = (dmax + dpadding) % (2*np.pi)
+    elif ((delta >= dmax) | (delta <= dmin)).all():
+        start_lon = (dmax - dpadding) % (2*np.pi)
+        stop_lon = (dmin + dpadding) % (2*np.pi)
+    else:
+        print("Something fishy is afoot...")
+        breakpoint()
+        
+    model = Hin.set_time_dependent_boundary(vc_grid, t_grid, 
+                                            start, simtime = (stop - start).days*u.day, 
+                                            bgrid_Carr = bc_grid,
+                                            lon_start = start_lon * u.rad, 
+                                            lon_stop =  stop_lon * u.rad,
+                                            frame='synodic',
+                                            r_min = 21.5 * u.solRad, r_max = target_obs.r.max(),
+                                            latitude = 0.0 * u.deg,
+                                            dt_scale = 50,
+                                            **kwargs)
+    
+    model.solve(cme_sample)
+    
+    ts = HA.get_observer_timeseries(model, observer='PSP', obs_pos=target_obs)
+    del model
+    
+    return ts
+
+def propagate_totarget(start, stop, target_obs, t_grids, vc_grids, bc_grids, cme_samples):
+    import multiprocessing as mp
+    from dask.distributed import Client
+    
+    # Determine number of cores to use
+    num_cores =  int(0.75 * mp.cpu_count())
+    
+    # Create a client with explicit configuration
+    client = Client(
+        n_workers = num_cores, 
+        threads_per_worker = 1,  # Recommended for Spyder
+        processes = True  # Use multiprocessing
+        )
+   
+    # Write the dashboard link
+    print_url('propagate_url.html', client.dashboard_link)
+    
+    # Create delayed futures
+    futures = [_dask_propagate_totarget(start, stop, target_obs, tg, vg, bg, cmes) 
+               for tg, vg, bg, cmes in zip(t_grids, vc_grids, vc_grids, cme_samples)]
+    
+    # Compute with multiple workers
+    results = dask.compute(*futures)
+    
+    client.close()
+    
+    return results
+       
+if __name__ == '__main__':
+    
+    runstart = datetime.datetime(2024, 4, 1)
+    runstop = datetime.datetime(2024, 6, 1)
+    n_samples = 8
+    target = 'PSP'
+
+    # Get padded runtimes
+    # !!!! This padding should be dynamic to account for propagation time to destination (Jupiter/Saturn)
+    padding = datetime.timedelta(days=27)
+    runstart_padded = runstart - padding
+    runstop_padded = runstop + padding
+
+    # Remove ICMEs from OMNI, and sample possible background solar wind conditions
+    omni_samples = make_BackgroundSolarWind_withGP(runstart_padded, runstop_padded, n_samples)
+
+    # Sample possible CME parameters
+    # !!!!! CHECK MODEL RUN TIME WITH DIFFERENT NUMBERS OF CMES (for same duration)
+    # Should we get rid of CMEs highly unlikely to matter?
+
+    cmes = create_CME_list(runstart_padded, runstop_padded)
+
+    cme_samples = perturb_CME_list(cmes, n_samples)
+
+    # Get Earth, Target Body Observer classes at 4h resolution (these don't change per sample)
+    times_for_pos = Time(omni_samples[0]['mjd'].to_numpy(), format='mjd')
+    earth_obs = H.Observer('EARTH', times_for_pos)
+    target_obs = H.Observer(target, times_for_pos)
+    
+    t0 = time.time()
+    
+    results = backmap(runstart_padded, runstop_padded, omni_samples, earth_obs)
+    t_grids, vc_grids, bc_grids = list(map(list, zip(*results)))
+    del results
+    
+    print(time.time() - t0)
+    
+    results = propagate_totarget(runstart_padded, runstop_padded, target_obs, 
+                                 t_grids, vc_grids, bc_grids, cme_samples)
+    
+    print(time.time() - t0)
+
+
+# # t_start = time.time()
+# # futures = []
+# # for 
+# # futures = [propagate_totarget_withdask(runstart_padded)]
+# # results = 
+
+# # %% Actually run DASK
+# # client = Client()
+# delayed_results = []
+# for omni_sample, cme_sample in zip(omni_samples, cme_samples):
+#     dr = solve_single_model_parallel(runstart_padded, runstop_padded,
+#                                      earth_pos, target_pos, 
+#                                      omni_sample, cme_sample)
+#     delayed_results.append(dr)
+    
+
+# t_start = timer.time()    
+# results = dask.compute(*delayed_results)
+# print(timer.time() - t_start)
+
+# # %%
+# # import multiprocessing as mp
+
+# # if __name__ == "__main__":
+    
+# #     args = [(a, b, c, d) for a, b, c, d in zip([runstart]*n_samples, 
+# #                                                [runstop]*n_samples,
+# #                                                omni_samples,
+# #                                                perturbed_cmelist)]
+    
+# #     cpus_available = mp.cpu_count()
+# #     results = []
+# #     with mp.Pool(cpus_available-1) as pool:
+# #         generator = pool.imap(worker, args)
+
+# #         for element in tqdm.tqdm(generator, total=len(args)):
             
-#             results.append(element)
-#     print("Program finished!")
+# #             results.append(element)
+# #     print("Program finished!")
 
-# test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0])
+# # test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0])
 
 
-# # Plot PSP data
-# psp_data = lookup_PSPData(runstart, runstop)
+# # # Plot PSP data
+# # psp_data = lookup_PSPData(runstart, runstop)
 
-# fig, ax = plt.subplots()
-# # ax.scatter(psp_data['mjd'], psp_data['U'], 
-# #            color='black', marker='x', lw=1.0, s=8,
+# # fig, ax = plt.subplots()
+# # # ax.scatter(psp_data['mjd'], psp_data['U'], 
+# # #            color='black', marker='x', lw=1.0, s=8,
+# # #            label = 'PSP Measurements')
+# # ax.plot(psp_data['mjd'], psp_data['U'], 
+# #            color='black', lw=1.0,
 # #            label = 'PSP Measurements')
-# ax.plot(psp_data['mjd'], psp_data['U'], 
-#            color='black', lw=1.0,
-#            label = 'PSP Measurements')
 
 
-# for i, result in enumerate(results):
-#     body_ts = HA.get_observer_timeseries(result, 'PSP')
-#     ax.plot(body_ts['mjd'], body_ts['vsw'],
-#             color='C4', lw=1, alpha=0.33)
-#     if i == 0:
-#         ax.plot(body_ts['mjd'][0:1], body_ts['vsw'][0:1],
-#                 color='C4', lw=1, alpha=1,
-#                 label = 'bOMNI-HUXt Ensemble')
-# ax.plot()
+# # for i, result in enumerate(results):
+# #     body_ts = HA.get_observer_timeseries(result, 'PSP')
+# #     ax.plot(body_ts['mjd'], body_ts['vsw'],
+# #             color='C4', lw=1, alpha=0.33)
+# #     if i == 0:
+# #         ax.plot(body_ts['mjd'][0:1], body_ts['vsw'][0:1],
+# #                 color='C4', lw=1, alpha=1,
+# #                 label = 'bOMNI-HUXt Ensemble')
+# # ax.plot()
     
-# ax.legend()
+# # ax.legend()
     
-# ax.set(ylim = (200,800), ylabel="Solar Wind Flow Speed [km/s]",
-#        xlabel = "Date [MJD]")
-# plt.suptitle("bOMNI-HUXt @ Parker Solar Probe, ICME-subtracted, CME-added, GP data imputation")
+# # ax.set(ylim = (200,800), ylabel="Solar Wind Flow Speed [km/s]",
+# #        xlabel = "Date [MJD]")
+# # plt.suptitle("bOMNI-HUXt @ Parker Solar Probe, ICME-subtracted, CME-added, GP data imputation")
 
 
 
