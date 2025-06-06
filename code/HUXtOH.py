@@ -309,7 +309,7 @@ def make_BackgroundSolarWind_withGP(start, stop, n_samples, omni = None, icmes =
     Yo_sig = Yoc_sig * speed_rescaler.scale_
     fo_samples = np.array([speed_rescaler.inverse_transform(f) for f in foc])
     
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(6,4))
     ax.scatter(omni['mjd'], omni['U'], color='C0', marker='.', s=2, zorder=1,
                label = 'OMNI Data')
     ax.scatter(omni_noicme['mjd'], omni_noicme['U'], color='black', marker='.', s=2, zorder=2,
@@ -325,8 +325,8 @@ def make_BackgroundSolarWind_withGP(start, stop, n_samples, omni = None, icmes =
         label=r"95% confidence interval", zorder=-2)
     
     for fo_sample in fo_samples:
-        ax.plot(Xo.ravel(), fo_sample.ravel(), lw=1, color='C4', alpha=0.1, zorder=-1)
-    ax.plot(Xo.ravel()[0:1], fo_sample.ravel()[0:1], lw=1, color='C4', alpha=1, 
+        ax.plot(Xo.ravel(), fo_sample.ravel(), lw=1, color='C3', alpha=0.05, zorder=-1)
+    ax.plot(Xo.ravel()[0:1], fo_sample.ravel()[0:1], lw=1, color='C3', alpha=1, 
             label = 'Samples about Mean')
     
     ax.legend(scatterpoints=3)
@@ -346,7 +346,7 @@ def make_BackgroundSolarWind_withGP(start, stop, n_samples, omni = None, icmes =
 # %% Get CMEs =================================================================
 # This only needs to be done once for the ensemble
 # =============================================================================
-def create_CME_list(runstart, runstop):
+def create_CME_list(runstart, runstop, latitude_range=[-90,90]):
     
     # Get the CMEs
     cmes = queryDONKI.CME(runstart, runstop)
@@ -361,7 +361,8 @@ def create_CME_list(runstart, runstop):
         w = 2*info['halfAngle']
         v = info['speed']
         thick = 4
-        if lon is not None:
+        
+        if (lon is not None) & (lat > latitude_range[0]) & (lat < latitude_range[1]):
             cme = H.ConeCME(t_launch=t*u.s, 
                             longitude=lon*u.deg, 
                             latitude=lat*u.deg, 
@@ -496,7 +497,56 @@ def HUXt_at(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, targe
    
     return model
 
-# %% 
+def HUXt_at_(body, runstart, runstop, time_grid, vgrid_Carr, dpadding=0.03, target_pos=None, **kwargs):
+    """
+    Run HUXt for a celestial body or spacecraft, computing the correct
+    longitudes to minimize runtime
+
+    Parameters
+    ----------
+    body : TYPE
+        DESCRIPTION.
+    **kwargs : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    
+    if target_pos is None:
+        target_pos = H.Observer(body, Time(time_grid, format='mjd'))
+    
+    # HEEQ longitude, continuous
+    delta = np.unwrap(target_pos.lon.value)
+    if (delta > 2*np.pi).any():
+        delta -= 2*np.pi
+    
+    # Max and Min of delta
+    dmin, dmax = np.min(delta), np.max(delta)
+    if ((delta >= dmin) & (delta <= dmax)).all():
+        start_lon = (dmin - dpadding) % (2*np.pi)
+        stop_lon = (dmax + dpadding) % (2*np.pi)
+    elif ((delta >= dmax) | (delta <= dmin)).all():
+        start_lon = (dmax - dpadding) % (2*np.pi)
+        stop_lon = (dmin + dpadding) % (2*np.pi)
+    else:
+        print("Something fishy is afoot...")
+        breakpoint()
+    
+    # # High res time grid, check that all points lie inside bounds...
+    # time_grid_hires = np.arange(time_grid[0], time_grid[-1], 0.01)
+    # body_pos_hires = H.Observer(body, Time(time_grid_hires, format='mjd'))
+    
+    model = Hin.set_time_dependent_boundary(vgrid_Carr, time_grid, 
+                                            runstart, simtime = (runstop - runstart).days*u.day, 
+                                            lon_start = start_lon * u.rad, 
+                                            lon_stop =  stop_lon * u.rad,
+                                            frame='synodic',
+                                            **kwargs)
+   
+    return model
 
 # # Now map each sample back
 # time_samples, vcarr_samples, bcarr_samples = [], [], []
@@ -531,6 +581,124 @@ def solve_single_model(_runstart, _runstop, _omni_df, _cme_list, _earth_pos, _ta
     model.solve(_cme_list)
     
     return model
+
+
+def solve_model_attarget(start, stop, tgrid, vgrid_carr, bgrid_carr, 
+                         target = None, cme_list = [], dpadding = 0.03, **kwargs):
+    from scipy.interpolate import RegularGridInterpolator
+    from tqdm import tqdm
+    
+    # Parse the target
+    if target is None:
+        target = 'EARTH'
+    # elif type(target) == str:
+    target_obs = H.Observer(target, Time(tgrid, format='mjd'))
+    # else:
+    #     target_obs = target
+        
+    # HEEQ longitude, continuous
+    delta = np.unwrap(target_obs.lon.value)
+    if (delta > 2*np.pi).any():
+        delta -= 2*np.pi
+    
+    # Max and Min of delta
+    dmin, dmax = np.min(delta), np.max(delta)
+    if ((delta >= dmin) & (delta <= dmax)).all():
+        start_lon = (dmin - dpadding) % (2*np.pi)
+        stop_lon = (dmax + dpadding) % (2*np.pi)
+    elif ((delta >= dmax) | (delta <= dmin)).all():
+        start_lon = (dmax - dpadding) % (2*np.pi)
+        stop_lon = (dmin + dpadding) % (2*np.pi)
+    else:
+        print("Something fishy is afoot...")
+        breakpoint()
+        
+    # # High res time grid, check that all points lie inside bounds...
+    # time_grid_hires = np.arange(time_grid[0], time_grid[-1], 0.01)
+    # body_pos_hires = H.Observer(body, Time(time_grid_hires, format='mjd'))
+    
+    model = Hin.set_time_dependent_boundary(vgrid_carr, tgrid, 
+                                            start, simtime = (stop - start).days*u.day, 
+                                            bgrid_Carr = bgrid_carr,
+                                            lon_start = start_lon * u.rad, 
+                                            lon_stop =  stop_lon * u.rad,
+                                            r_max = np.max(target_obs.r.to(u.solRad)),
+                                            frame='synodic',
+                                            **kwargs)
+    
+    model.solve(cme_list)
+    
+    # Sample the model at the target
+    time_series = HA.get_observer_timeseries(model, target)
+    
+    cme_arrivals = []
+    for cme in model.cmes:
+        cme_stats = cme.compute_arrival_at_body(target)
+        if cme_stats['t_arrive'].jyear > 1000:
+            datestr = cme_stats['t_arrive'].isot
+            cme_arrivals.append(datetime.datetime.fromisoformat(datestr))
+    
+    # # This produces the ~same results as HA.get_observer_timeseries
+    # t_model = (model.time_init + model.time_out).mjd
+    # r_model = model.r_grid[:,0].to(u.solRad).value
+    # l_model = model.lon_grid[0,:].to(u.rad).value
+    
+    # interp_v = RegularGridInterpolator((t_model, r_model, l_model), model.v_grid, bounds_error=False, fill_value=np.nan)
+    # interp_b = RegularGridInterpolator((t_model, r_model, l_model), model.b_grid, bounds_error=False, fill_value=np.nan)
+    # del model # Free memory
+    
+    # trl_sample = [[t, r, l] for t, r, l in zip(target_obs.time.mjd, target_obs.r.value, target_obs.lon.value)]
+    # v_sample = interp_v(trl_sample)
+    # b_sample = interp_b(trl_sample)
+
+    # output = pd.DataFrame(data={'time': target_obs.time, 
+    #                             'r': target_obs.r.value, 
+    #                             'lon': target_obs.lon.value, 
+    #                             'vsw': v_sample, 
+    #                             'bpol': b_sample, 
+    #                             'mjd': target_obs.time.mjd})
+    
+    return time_series
+
+def solve_model_attarget_dask(start, stop, tgrids, vgrids_carr, bgrids_carr, 
+                              target, cme_lists = [], dpadding = 0.03, **kwargs):
+    from dask.distributed import Client
+
+    client = Client(n_workers=4,
+                    threads_per_worker=1,
+                    )
+
+    futures = []
+    for tg, vg, bg, cmes in zip(tgrids, vgrids_carr, bgrids_carr, cme_lists):
+        future = client.submit(solve_model_attarget, start, stop, tg, vg, bg, target, cmes, dpadding, **kwargs)
+        futures.append(future)
+
+    breakpoint()
+    
+    return 
+
+
+
+def solve_model_attarget_parallel(start, stop, tgrids, vgrids_carr, bgrids_carr, 
+                                  target = None, cme_lists = [], dpadding = 0.03, **kwargs):
+    import multiprocessing as mp
+    
+    def solve_model_attarget_star(args):
+        return solve_model_attarget(*args)
+    
+    arg_list = [(start, stop, tgrid, vgrid_carr, bgrid_carr, target, cme_list, kwargs) 
+                for tgrid, vgrid_carr, bgrid_carr, cme_list in zip(tgrids, vgrids_carr, bgrids_carr, cme_lists)]
+    
+    n_cpus = int(0.5 * mp.cpu_count())
+    results = []
+    with mp.Pool(n_cpus) as pool:
+        generator = pool.imap(solve_model_attarget_star, arg_list)
+
+        for element in tqdm(generator, total=len(arg_list)):
+            results.append(element)
+            
+    return results
+    
 
 # test = solve_single_model(runstart, runstop, omni_samples[0], perturbed_cmelist[0], earth_pos, target_pos)
 # %% Single processing
