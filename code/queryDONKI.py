@@ -40,7 +40,7 @@ def CME(start, end):
     # Must have CME analysis:
     notAnalyzed_index = []
     for index, row in df.iterrows():
-        if row['cmeAnalyses'] is None:
+        if (row['cmeAnalyses'] is None) or (row['cmeAnalyses'] == []):
             notAnalyzed_index.append(index)
     df = df.drop(notAnalyzed_index, axis='index')
     
