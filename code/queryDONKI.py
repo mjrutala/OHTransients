@@ -66,7 +66,7 @@ def CME(start, end):
     df = df.drop(index)
     return df
 
-def ICME(start, end, location='Earth', duration=1.5*u.day):
+def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     """
     Read the DONKI InterPlanetary Shock (IPS) list, and optionally cross-
     reference with the DONKI CME list to identify ICMEs
@@ -104,17 +104,18 @@ def ICME(start, end, location='Earth', duration=1.5*u.day):
         df.loc[index] = row
         
     # ICMEs must be linked to CMEs; drop IPSs that aren't
-    delta = datetime.timedelta(days = 7)
-    cme_df = CME(start - delta, end)
-    df['linkedEvents'] = ''
-    for index, row in df.iterrows():
-        matches = [row['activityID'] in l for l in cme_df['linkedEvents']]
-        
-        if np.array(matches).any() == False:
-            df = df.drop(index, axis='index')
-        else:
-            row['linkedEvents'] = cme_df.loc[matches, 'activityID'].values[0]
-            df.loc[index] = row
+    if ensureCME:
+        delta = datetime.timedelta(days = 27)
+        cme_df = CME(start - delta, end)
+        df['linkedEvents'] = ''
+        for index, row in df.iterrows():
+            matches = [row['activityID'] in l for l in cme_df['linkedEvents']]
+            
+            if np.array(matches).any() == False:
+                df = df.drop(index, axis='index')
+            else:
+                row['linkedEvents'] = cme_df.loc[matches, 'activityID'].values[0]
+                df.loc[index] = row
             
     # Set the duration of the event
     df['duration'] = duration
