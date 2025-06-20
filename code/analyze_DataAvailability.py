@@ -123,7 +123,7 @@ Ulysses_res = Fido.search(a.Time(tstart, tend),
 Ulysses_files = Fido.fetch(Ulysses_res, path=huxt_oh_dir+'/data/Ulysses/')
 while len(Ulysses_files.errors) > 0:
     Ulysses_files = Fido.fetch(Ulysses_files, path=huxt_oh_dir+'/data/Ulysses/')
-Ulysses_df = TimeSeries(Ulysses_files, concatenate=True).to_dateframe()
+Ulysses_df = TimeSeries(Ulysses_files, concatenate=True).to_dataframe()
 
 datasets_dict['Ulysses'] = Ulysses_df
 
