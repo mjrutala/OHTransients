@@ -8,36 +8,36 @@ Created on Thu Apr 10 12:20:39 2025
 import astropy.units as u
 from astropy.time import Time
 import datetime
-import datetime
-import os
-import astropy.units as u
-import glob
-import re
+# import datetime
+# import os
+# import astropy.units as u
+# import glob
+# import re
 import numpy as np
 import time
 from sunpy.net import Fido
 from sunpy.net import attrs
 from sunpy.timeseries import TimeSeries
-import requests
+# import requests
 import matplotlib.pyplot as plt
 import pandas as pd
 from astroquery.jplhorizons import Horizons
-import dask
+# import dask
 import pickle
 import tqdm
+import copy
 
 import sys
-sys.path.append('/Users/mrutala/projects/OHTransients/HUXt/code/')
+sys.path.append('/Users/mrutala/projects/HUXt/code/')
 sys.path.append('/Users/mrutala/projects/OHTransients/code/')
 import huxt as H
 import huxt_analysis as HA
 import huxt_inputs as Hin
-# import huxt_atObserver as hao
-from scipy import ndimage
-from scipy import stats
-from sklearn.metrics import root_mean_squared_error as rmse
-
-from astroquery.jplhorizons import Horizons
+import huxt_atObserver as hao
+# from scipy import ndimage
+# from scipy import stats
+# from sklearn.metrics import root_mean_squared_error as rmse
+# from astroquery.jplhorizons import Horizons
 
 # import huxt_inputs_wsa as Hin_wsa
 import queryDONKI
@@ -152,6 +152,11 @@ class msir_inputs:
         self.SynodicCarringtonRotation = 25.38 * u.day
         
         # Input data initialization
+        cols = ['t_mu', 't_sig', 'lon_mu', 'lon_sig', 'lat_mu', 'lat_sig',
+                'width_mu', 'width_sig', 'speed_mu', 'speed_sig', 
+                'thickness_mu', 'thickness_sig', 'innerbound']
+        self.cmeDistribution = pd.DataFrame(columns = cols)
+        
         
         self.path_cohodata = '/Users/mrutala/projects/OHTransients/data/'
         return
@@ -194,6 +199,9 @@ class msir_inputs:
     def boundarySources(self):
         boundarySources = set(self.availableTransientData['affiliated_source'])
         return sorted(boundarySources)
+    
+    def copy(self):
+        return copy.deepcopy(self)
     
     def _identify_source(self, source):
         
@@ -755,6 +763,7 @@ class msir_inputs:
             # Generate the Carrington grids
             t, vcarr, bcarr = Hin.generate_vCarr_from_OMNI(self.simstart, self.simstop, 
                                                            omni_input=insitu_df, corot_type=corot_type)
+
             
             # Map to 210 solar radii, then to the inner boundary for the model
             vcarr_210 = vcarr.copy()
@@ -788,7 +797,10 @@ class msir_inputs:
             insitu_df = insitu_df.reset_index()
         
             # Map inwards once to get the appropriate dimensions, etc.
-            t, vcarr, bcarr = Hin.generate_vCarr_from_OMNI(self.simstart, self.simstop, omni_input=insitu_df)
+            # t, vcarr, bcarr = Hin.generate_vCarr_from_OMNI(self.simstart, self.simstop, omni_input=insitu_df)
+            t, vcarr, bcarr = Hin.generate_vCarr_from_insitu(self.simstart, self.simstop, omni_input=insitu_df)
+        
+            breakpoint()
         
             # # Dask client for monitoring & worker setup
             # from dask.distributed import Client
@@ -920,7 +932,48 @@ class msir_inputs:
         
         return
     
-    def generate_boundaryDistribution3D(self):
+    def generate_boundaryDistribution3D(self, nLat=32, extend=None, GP=True):
+        
+        # Get dimensions from OMNI boundary distribution, which *must* exist
+        nLon, nTime = self.boundaryDistributions['omni']['U_mu_grid'].shape
+        
+        # Coordinates = (lat, lon, time)
+        # Values = boundary speed, magnetic field* (*not implemented fully)
+        lat_for3d = np.linspace(-self.latmax.value, self.latmax.value, nLat)
+        lon_for3d = np.linspace(0, 360, nLon)
+        mjd_for3d = self.boundaryDistributions['omni']['t_grid']
+        
+        if (type(extend) == str) & (GP == True):
+            print("Cannot have extend=str and GP=True!")
+            return
+        if type(extend) == str:
+            U_mu_3d, U_sigma_3d, B_3d = self._extend_boundaryDistributions(nLat, extend)
+        elif GP is True:
+            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d)
+            
+        
+        self.boundaryDistributions3D = {'t_grid': mjd_for3d,
+                                        'lon_grid': lon_for3d,
+                                        'lat_grid': lat_for3d,
+                                        'U_mu_grid': U_mu_3d,
+                                        'U_sig_grid': U_sigma_3d,
+                                        'B_grid': B_3d,
+                                        }
+        
+        return
+        
+    def _extend_boundaryDistributions(self, nLat, name):
+        
+        U_mu_3d = np.tile(self.boundaryDistributions[name]['U_mu_grid'], 
+                          (nLat, 1, 1))
+        U_sigma_3d = np.tile(self.boundaryDistributions[name]['U_sig_grid'], 
+                          (nLat, 1, 1))
+        B_3d = np.tile(self.boundaryDistributions[name]['B_grid'], 
+                          (nLat, 1, 1))
+        
+        return U_mu_3d, U_sigma_3d, B_3d
+        
+    def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d):
         import gpflow
         import tensorflow as tf
         from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -930,16 +983,9 @@ class msir_inputs:
         from joblib import Parallel, delayed
         
         # Get dimensions from OMNI boundary distribution, which *must* exist
-        nLon, nTime = self.boundaryDistributions['omni']['U_mu_grid'].shape
-        nLat = int(nLon/4)
-        
-        # Coordinates = (lon, time, lat)
-        # Values = boundary speed, magnetic field* (*not implemented fully)
-        lat_for3d = np.linspace(-self.latmax.value, self.latmax.value, nLat)
-        lon_for3d = np.linspace(0, 360, nLon)
-        mjd_for3d = self.boundaryDistributions['omni']['t_grid']
-        # U_mu_3d = np.zeros((nLat, nLon, nTime))
-        # U_sigma_3d = np.zeros((nLat, nLon, nTime))
+        nLat = len(lat_for3d)
+        nLon = len(lon_for3d)
+        nMjd = len(mjd_for3d)
         
         # Setup Normalizations ahead of time
         lat_scaler = MinMaxScaler((0,1))
@@ -957,7 +1003,7 @@ class msir_inputs:
                                  for _, v in self.boundaryDistributions.items()
                                  ]).flatten()[:,None])
         
-        rng = np.random.default_rng()
+        # rng = np.random.default_rng()
         # for i in range(nTime):
         lat, lon, mjd, val_mu, val_sigma, = [], [], [], [], []
         # lat, lon, mjd, val, = [], [], [], []
@@ -1142,19 +1188,13 @@ class msir_inputs:
         U_mu = val_scaler.inverse_transform(Ymu)
         U_sigma = val_scaler.scale_ * np.sqrt(Ysigma**2 + Ymusigma**2)
         
-        U_mu_3d = U_mu.reshape(nLat, nLon, nTime)
-        U_sigma_3d = U_sigma.reshape(nLat, nLon, nTime)
+        U_mu_3d = U_mu.reshape(nLat, nLon, nMjd)
+        U_sigma_3d = U_sigma.reshape(nLat, nLon, nMjd)
         
         # Generate an OBVIOUSLY WRONG B
-        B_grid_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
+        B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
         
-        self.boundaryDistributions3D = {'t_grid': mjd_for3d,
-                                        'lon_grid': lon_for3d,
-                                        'lat_grid': lat_for3d,
-                                        'U_mu_grid': U_mu_3d,
-                                        'U_sig_grid': U_sigma_3d,
-                                        'B_grid': B_grid_3d,
-                                        }
+        return U_mu_3d, U_sigma_3d, B_3d
         
         # =============================================================================
         # Visualization     
@@ -1243,7 +1283,7 @@ class msir_inputs:
                 'U_sig_grid': U_sigma_2d,
                 'B_grid': B_grid}
     
-    def generate_cmeDistribution(self):
+    def generate_cmeDistribution(self, search=True):
         
         # 
         t_sig_init = 36000 # seconds
@@ -1255,50 +1295,51 @@ class msir_inputs:
         speed_sig_init = 400 # km/s
         
         # Get the CMEs
-        cmes = queryDONKI.CME(self.simstart, self.simstop)
-
-        cmeDistribution_dict = {'t_mu': [], 't_sig': [],
-                                'lon_mu': [], 'lon_sig': [],
-                                'lat_mu': [], 'lat_sig': [],
-                                'width_mu': [], 'width_sig': [],
-                                'speed_mu': [], 'speed_sig': [],
-                                'thickness_mu': [], 'thickness_sig': [],
-                                'innerbound': []}
+        if search == True:
+            cmes = queryDONKI.CME(self.simstart, self.simstop)
+        else:
+            return
         
         for index, row in cmes.iterrows():
+            # Extract CME Analysis info
             info = row['cmeAnalyses']
             
+            # Setup a dict to hold CME params
+            cmeDistribution_dict = {}
+            
             t = (datetime.datetime.strptime(info['time21_5'], "%Y-%m-%dT%H:%MZ") - self.simstart).total_seconds()
-            cmeDistribution_dict['t_mu'].append(t)
-            cmeDistribution_dict['t_sig'].append(t_sig_init)
+            cmeDistribution_dict['t_mu'] = t
+            cmeDistribution_dict['t_sig'] = t_sig_init
             
-            cmeDistribution_dict['lon_mu'].append(info['longitude'])
-            cmeDistribution_dict['lon_sig'].append(lon_sig_init)
+            cmeDistribution_dict['lon_mu'] = info['longitude']
+            cmeDistribution_dict['lon_sig'] = lon_sig_init
             
-            cmeDistribution_dict['lat_mu'].append(info['latitude'])
-            cmeDistribution_dict['lat_sig'].append(lat_sig_init)
+            cmeDistribution_dict['lat_mu'] = info['latitude']
+            cmeDistribution_dict['lat_sig'] = lat_sig_init
             
-            cmeDistribution_dict['width_mu'].append(2*info['halfAngle'])
-            cmeDistribution_dict['width_sig'].append(width_sig_init)
+            cmeDistribution_dict['width_mu'] = 2*info['halfAngle']
+            cmeDistribution_dict['width_sig'] = width_sig_init
             
-            cmeDistribution_dict['speed_mu'].append(info['speed'])
-            cmeDistribution_dict['speed_sig'].append(speed_sig_init)
+            cmeDistribution_dict['speed_mu'] = info['speed']
+            cmeDistribution_dict['speed_sig'] = speed_sig_init
             
-            cmeDistribution_dict['thickness_mu'].append(thick_mu_init)
-            cmeDistribution_dict['thickness_sig'].append(thick_sig_init)
+            cmeDistribution_dict['thickness_mu'] = thick_mu_init
+            cmeDistribution_dict['thickness_sig'] = thick_sig_init
             
-            cmeDistribution_dict['innerbound'].append(21.5)
+            cmeDistribution_dict['innerbound'] = 21.5
+            
+            self.cmeDistribution.loc[index, :] = cmeDistribution_dict
          
-        cmeDistribution = pd.DataFrame(cmeDistribution_dict)
+        # cmeDistribution = pd.DataFrame(cmeDistribution_dict)
         
         # Drop CMEs at high lat
-        lat_cutoff = np.abs(cmeDistribution['lat_mu']) > 2.0*self.latmax
-        cmeDistribution.loc[lat_cutoff, 'lat_mu'] = np.nan
+        lat_cutoff = np.abs(self.cmeDistribution['lat_mu']) > 2.0*self.latmax
+        self.cmeDistribution.loc[lat_cutoff, 'lat_mu'] = np.nan
         
         # Drop NaNs
-        cmeDistribution.dropna(how='any', axis='index', inplace = True)
+        self.cmeDistribution.dropna(how='any', axis='index', inplace = True)
         
-        self.cmeDistribution = cmeDistribution
+        # self.cmeDistribution = cmeDistribution
         
         return
     
@@ -1413,7 +1454,7 @@ class msir_inputs:
         
         return boundarySamples_U, cmeSamples
     
-    def predict(self, boundarySamples_U, cmeSamples, observer_name, dpadding=0.03):
+    def predict_withDask(self, boundarySamples_U, cmeSamples, observer_name, dpadding=0.03):
         import multiprocessing as mp
         from tqdm import tqdm
         from dask.distributed import Client, wait, progress, as_completed
@@ -1501,13 +1542,13 @@ class msir_inputs:
             
         return ensemble
     
-    def predict2(self, boundarySamples_U, cmeSamples, observer_name, dpadding=0.03):
+    def predict(self, boundarySamples_U, cmeSamples, observer_name, dpadding=0.03):
         import multiprocessing as mp
         from tqdm import tqdm
         from joblib import Parallel, delayed
         
-    
         t0 = time.time()
+        nSamples = len(boundarySamples_U)
         
         # DO NOT loop over this bit
         observer = H.Observer(observer_name, Time(self.boundaryDistributions3D['t_grid'], format='mjd'))
@@ -1551,7 +1592,7 @@ class msir_inputs:
         
         futureGenerator = Parallel(return_as='generator', n_jobs=nCores)(
             delayed(runHUXt)(boundarySample_U, cmeSample) 
-            for boundarySample_U, cmeSample in zip(boundarySamples, cmeSamples)
+            for boundarySample_U, cmeSample in zip(boundarySamples_U, cmeSamples)
             )
         
         ensemble = list(tqdm(futureGenerator, total=nSamples))
@@ -1561,22 +1602,22 @@ class msir_inputs:
         # =============================================================================
         # Visualize    
         # =============================================================================
-        fig, ax = plt.subplots(figsize=(6,4.5))
+        # fig, ax = plt.subplots(figsize=(6,4.5))
         
-        for member in ensemble:
-            ax.plot(member['mjd'], member['U'], color='C3', lw=1, alpha=0.2)
-        ax.plot(member['mjd'][0:1], member['U'][0:1], lw=1, color='C3', alpha=1, 
-                label = 'Ensemble Members')
+        # for member in ensemble:
+        #     ax.plot(member['mjd'], member['U'], color='C3', lw=1, alpha=0.2)
+        # ax.plot(member['mjd'][0:1], member['U'][0:1], lw=1, color='C3', alpha=1, 
+        #         label = 'Ensemble Members')
         
         
-        ax.legend(scatterpoints=3, loc='upper right')
+        # ax.legend(scatterpoints=3, loc='upper right')
         
-        ax.set(xlim=[self.starttime.mjd, self.stoptime.mjd])
-        ax.set(xlabel='Date [MJD], from {}'.format(datetime.datetime.strftime(self.start, '%Y-%m-%d %H:%M')), 
-               ylabel='Solar Wind Speed [km/s]', 
-               title='HUXt Ensemble @ {}'.format(observer_name))
+        # ax.set(xlim=[self.starttime.mjd, self.stoptime.mjd])
+        # ax.set(xlabel='Date [MJD], from {}'.format(datetime.datetime.strftime(self.start, '%Y-%m-%d %H:%M')), 
+        #        ylabel='Solar Wind Speed [km/s]', 
+        #        title='HUXt Ensemble @ {}'.format(observer_name))
         
-        plt.show()
+        # plt.show()
         
         # Save ensemble
         self.current_ensemble = ensemble
@@ -1783,13 +1824,13 @@ if __name__ == '__main__':
     import copy
     
     # Checkpoint for testing: skip things you know work already
-    skip_to_checkpoint = True
+    skip_to_checkpoint = False
 
     if not skip_to_checkpoint:
         # ========================================================================
         # Initialize an MSIR inputs object
         # =========================================================================
-        start = datetime.datetime(2012, 6, 1)
+        start = datetime.datetime(2012, 1, 1)
         stop = datetime.datetime(2012, 7, 1)
         rmax = 10 # AU
         latmax = 15
@@ -1816,15 +1857,20 @@ if __name__ == '__main__':
         #   - GP interpolate 3D (time, lon, lat) source model
         # =============================================================================
         
+        # Generate an input CME distribution
+        inputs.generate_cmeDistribution()
+        
+        
         inputs.generate_backgroundDistributions()
         
         inputs.generate_boundaryDistributions(nSamples=16, constant_sig=0)
         
-        # Either choose one boundary distribution, or do a 3D GP interpolation
-        inputs.generate_boundaryDistribution3D()
         
-        # Generate an input CME distribution
-        inputs.generate_cmeDistribution()
+        # Either choose one boundary distribution, or do a 3D GP interpolation
+        # inputs.generate_boundaryDistribution3D(nLat=32, extend='omni', GP=False)
+        inputs.generate_boundaryDistribution3D(nLat=32, GP=True)
+        
+
         
         # Add Saturn SKR Data
         saturn_df = generate_external_input.Cassini_SKR(inputs.availableBackgroundData.index)
@@ -1832,7 +1878,7 @@ if __name__ == '__main__':
                                                   saturn_df,
                                                   left_index=True, right_index=True)
         
-        nSamples = 64
+        nSamples = 16
         weights = [1/nSamples]*nSamples
         
         # for source in ...
@@ -1852,603 +1898,603 @@ if __name__ == '__main__':
     # CIME interaction time @ Saturn (Palmerio+ 2021)
     interaction_time = datetime.datetime(2012, 6, 12, 00, 00)
     
-    # %%=============================================================================
-    # PRE X: Plot locations of sources (top-down, heliolatitude)
-    # =============================================================================
-    fig, axs = plt.subplots(nrows=2, height_ratios=[2.5, 1], figsize=[4, 4.5])
-    plt.subplots_adjust(bottom=(0.15), left=(0.16), top=(1-0.135), right=(1-0.04),
-                        hspace=0.02)
+    # # %%=============================================================================
+    # # PRE X: Plot locations of sources (top-down, heliolatitude)
+    # # =============================================================================
+    # fig, axs = plt.subplots(nrows=2, height_ratios=[2.5, 1], figsize=[4, 4.5])
+    # plt.subplots_adjust(bottom=(0.15), left=(0.16), top=(1-0.135), right=(1-0.04),
+    #                     hspace=0.02)
     
-    target_subset = inputs.availableBackgroundData.query("@inputs.start <= index < @inputs.stop")
+    # target_subset = inputs.availableBackgroundData.query("@inputs.start <= index < @inputs.stop")
     
-    colors = {'omni': 'xkcd:forest green',
-              'stereo a': 'xkcd:ruby',
-              'stereo b': 'xkcd:sapphire',
-              'saturn': 'xkcd:beige'}
+    # colors = {'omni': 'xkcd:forest green',
+    #           'stereo a': 'xkcd:ruby',
+    #           'stereo b': 'xkcd:sapphire',
+    #           'saturn': 'xkcd:beige'}
     
-    axs[0].scatter([0], [0], marker='o', s=64, color='gold') # The Sun
-    for source in inputs.availableSources:
+    # axs[0].scatter([0], [0], marker='o', s=64, color='gold') # The Sun
+    # for source in inputs.availableSources:
         
-        x_polar = target_subset[(source, 'rad_HGI')] * \
-            np.cos(np.deg2rad(target_subset[(source, 'lon_HGI')] + 60))
-        y_polar = target_subset[(source, 'rad_HGI')] * \
-            np.sin(np.deg2rad(target_subset[(source, 'lon_HGI')] + 60))
+    #     x_polar = target_subset[(source, 'rad_HGI')] * \
+    #         np.cos(np.deg2rad(target_subset[(source, 'lon_HGI')] + 60))
+    #     y_polar = target_subset[(source, 'rad_HGI')] * \
+    #         np.sin(np.deg2rad(target_subset[(source, 'lon_HGI')] + 60))
             
-        axs[0].plot(x_polar, y_polar,
-                    color=colors[source], lw=1.5, ls=':')
+    #     axs[0].plot(x_polar, y_polar,
+    #                 color=colors[source], lw=1.5, ls=':')
         
-        axs[0].scatter(x_polar[-1], y_polar[-1],
-                       color=colors[source], marker='o', s=16, label=source)
+    #     axs[0].scatter(x_polar[-1], y_polar[-1],
+    #                    color=colors[source], marker='o', s=16, label=source)
         
-        axs[1].plot(target_subset['mjd'], target_subset[(source, 'lat_HGI')],
-                    color=colors[source], lw=1.5)
+    #     axs[1].plot(target_subset['mjd'], target_subset[(source, 'lat_HGI')],
+    #                 color=colors[source], lw=1.5)
 
         
-    axs[0].set(xlim=[-10,2], xlabel=r'$X_{HGI}$ [AU]', 
-               ylim=[-6,3], ylabel=r'$Y_{HGI}$ [AU]')
-    axs[0].tick_params(which='both', top=True, labeltop=True, bottom=False, labelbottom=False)
-    axs[0].xaxis.set_label_position('top')
-    axs[0].annotate("Date: {}".format(target_subset.index[-1].strftime("%Y-%m-%d %H:%M")), (0,1), (1,-1),
-                    'axes fraction', 'offset fontsize')
-    axs[0].annotate("MJD: {}".format(inputs.stoptime.mjd), (0,1), (1,-2),
-                    'axes fraction', 'offset fontsize')
-    axs[0].legend(bbox_to_anchor=(0., 1.155, 1., .102), loc='lower left',
-                  ncols=4, mode="expand", borderaxespad=0.)   
+    # axs[0].set(xlim=[-10,2], xlabel=r'$X_{HGI}$ [AU]', 
+    #            ylim=[-6,3], ylabel=r'$Y_{HGI}$ [AU]')
+    # axs[0].tick_params(which='both', top=True, labeltop=True, bottom=False, labelbottom=False)
+    # axs[0].xaxis.set_label_position('top')
+    # axs[0].annotate("Date: {}".format(target_subset.index[-1].strftime("%Y-%m-%d %H:%M")), (0,1), (1,-1),
+    #                 'axes fraction', 'offset fontsize')
+    # axs[0].annotate("MJD: {}".format(inputs.stoptime.mjd), (0,1), (1,-2),
+    #                 'axes fraction', 'offset fontsize')
+    # axs[0].legend(bbox_to_anchor=(0., 1.155, 1., .102), loc='lower left',
+    #               ncols=4, mode="expand", borderaxespad=0.)   
     
-    axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel='Heliolatitude [deg.]')
-    axs12 = axs[1].secondary_xaxis(-0.23, 
-                functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
-    axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
+    # axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel='Heliolatitude [deg.]')
+    # axs12 = axs[1].secondary_xaxis(-0.23, 
+    #             functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
+    # axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
     
-    axs[1].axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
-    plt.show()
+    # axs[1].axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
+    # plt.show()
     
-    # %%=============================================================================
-    # PRE X: SKR data during region of interest
-    # =============================================================================
-    fig, axs = plt.subplots(nrows=2, figsize=[4, 4.5], sharex=True, sharey=True)
-    plt.subplots_adjust(bottom=(0.15), left=(0.16), top=(1-0.045), right=(1-0.04),
-                        hspace=0.1)
+    # # %%=============================================================================
+    # # PRE X: SKR data during region of interest
+    # # =============================================================================
+    # fig, axs = plt.subplots(nrows=2, figsize=[4, 4.5], sharex=True, sharey=True)
+    # plt.subplots_adjust(bottom=(0.15), left=(0.16), top=(1-0.045), right=(1-0.04),
+    #                     hspace=0.1)
     
-    axs[0].set(ylim=[0,8e8])
-    for source in ['saturn']:
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_RH_core')],
-                color='red', lw=0.5, zorder=-10, alpha=0.10,  
-                label='1-hour')
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
-                color='red', lw=1.0, zorder=-10, alpha=1.0,  
-                label='10-hour')
-        axs[0].legend(loc='upper right')
+    # axs[0].set(ylim=[0,8e8])
+    # for source in ['saturn']:
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_RH_core')],
+    #             color='red', lw=0.5, zorder=-10, alpha=0.10,  
+    #             label='1-hour')
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
+    #             color='red', lw=1.0, zorder=-10, alpha=1.0,  
+    #             label='10-hour')
+    #     axs[0].legend(loc='upper right')
         
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_LH_core')],
-                color='black', lw=0.5, zorder=-10, alpha=0.10, 
-                label='1-hour')
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_LH_core')],
+    #             color='black', lw=0.5, zorder=-10, alpha=0.10, 
+    #             label='1-hour')
         
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
-                color='black', lw=1.0, zorder=-10, alpha=1.0, 
-                label='10-hour')
-        axs[1].legend(loc='upper right')
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
+    #             color='black', lw=1.0, zorder=-10, alpha=1.0, 
+    #             label='10-hour')
+    #     axs[1].legend(loc='upper right')
         
     
-    axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Right-hand Polarized')
-    axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Left-hand Polarized')
+    # axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Right-hand Polarized')
+    # axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Left-hand Polarized')
     
-    axs12 = axs[1].secondary_xaxis(-0.115, 
-                functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
-    axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
+    # axs12 = axs[1].secondary_xaxis(-0.115, 
+    #             functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
+    # axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
     
-    fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
+    # fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
     
-    for ax in axs: 
-        ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
-    plt.show()
+    # for ax in axs: 
+    #     ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
+    # plt.show()
     
-    # %% =============================================================================
-    # PRE X: Plot normal, non-GP backmapped boundaries
-    # =============================================================================
-    # Setup stuff
-    # Pick a fixed time by index and find the associated MJD
-    fixed_time_mjd = Time(interaction_time).mjd
-    fixed_time_indx = np.interp(fixed_time_mjd, 
-                                inputs.boundaryDistributions3D['t_grid'], 
-                                np.arange(len(inputs.boundaryDistributions3D['t_grid'])))
-    fixed_time_indx = np.round(fixed_time_indx).astype(int)
+    # # %% =============================================================================
+    # # PRE X: Plot normal, non-GP backmapped boundaries
+    # # =============================================================================
+    # # Setup stuff
+    # # Pick a fixed time by index and find the associated MJD
+    # fixed_time_mjd = Time(interaction_time).mjd
+    # fixed_time_indx = np.interp(fixed_time_mjd, 
+    #                             inputs.boundaryDistributions3D['t_grid'], 
+    #                             np.arange(len(inputs.boundaryDistributions3D['t_grid'])))
+    # fixed_time_indx = np.round(fixed_time_indx).astype(int)
    
     
-    # What latitude is the source at at this time? In descending order
-    fixed_time_lats = {}
-    for source in inputs.boundarySources:
-        fixed_time_lat = np.interp(fixed_time_mjd,
-                                   inputs.availableBackgroundData['mjd'],
-                                   inputs.availableBackgroundData[(source, 'lat_HGI')])
-        fixed_time_lats[source] = fixed_time_lat
-    fixed_time_lats = {k: v for k, v in sorted(fixed_time_lats.items(), key=lambda x: x[1], reverse=True)}
+    # # What latitude is the source at at this time? In descending order
+    # fixed_time_lats = {}
+    # for source in inputs.boundarySources:
+    #     fixed_time_lat = np.interp(fixed_time_mjd,
+    #                                inputs.availableBackgroundData['mjd'],
+    #                                inputs.availableBackgroundData[(source, 'lat_HGI')])
+    #     fixed_time_lats[source] = fixed_time_lat
+    # fixed_time_lats = {k: v for k, v in sorted(fixed_time_lats.items(), key=lambda x: x[1], reverse=True)}
     
-    # Actual plot
-    fig, axs = plt.subplots(nrows=len(inputs.boundarySources), sharex=True, sharey=True,
-                            figsize=(4, 4.5))
-    plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
-                        hspace=0)
+    # # Actual plot
+    # fig, axs = plt.subplots(nrows=len(inputs.boundarySources), sharex=True, sharey=True,
+    #                         figsize=(4, 4.5))
+    # plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
+    #                     hspace=0)
     
-    lon_grid = np.linspace(0, 360, inputs.boundaryDistributions['omni']['U_mu_grid'].shape[0])
+    # lon_grid = np.linspace(0, 360, inputs.boundaryDistributions['omni']['U_mu_grid'].shape[0])
     
-    for ax, source in zip(axs, fixed_time_lats.keys()):
+    # for ax, source in zip(axs, fixed_time_lats.keys()):
         
-        U_mu = inputs.boundaryDistributions[source]['U_mu_grid'][:,fixed_time_indx]
-        U_upper = U_mu + inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
-        U_lower = U_mu - inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
+    #     U_mu = inputs.boundaryDistributions[source]['U_mu_grid'][:,fixed_time_indx]
+    #     U_upper = U_mu + inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
+    #     U_lower = U_mu - inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
         
-        ax.plot(lon_grid, U_mu,
-                color='xkcd:pumpkin', lw=1.5,
-                label = 'Backmapped Data')
-        ax.fill_between(lon_grid, U_upper, U_lower,
-                        color='xkcd:pumpkin', alpha=0.33,
-                        label='95% CI')
-        bbox = dict(boxstyle="round", fc='white', ec='black',
-                    pad=0.2, alpha=0.66)
-        ax.annotate(source, (0,1), (1,-1), 
-                    'axes fraction', 'offset fontsize',
-                    color='black', ha='left', va='top',
-                    bbox=bbox)
+    #     ax.plot(lon_grid, U_mu,
+    #             color='xkcd:pumpkin', lw=1.5,
+    #             label = 'Backmapped Data')
+    #     ax.fill_between(lon_grid, U_upper, U_lower,
+    #                     color='xkcd:pumpkin', alpha=0.33,
+    #                     label='95% CI')
+    #     bbox = dict(boxstyle="round", fc='white', ec='black',
+    #                 pad=0.2, alpha=0.66)
+    #     ax.annotate(source, (0,1), (1,-1), 
+    #                 'axes fraction', 'offset fontsize',
+    #                 color='black', ha='left', va='top',
+    #                 bbox=bbox)
     
-    axs[0].legend(bbox_to_anchor=(0., 1.05, 1., .102), loc='lower left',
-                  ncols=1, mode="expand", borderaxespad=0.)   
-    axs[0].set(xlim=[0,360], ylim=[250, 700])
+    # axs[0].legend(bbox_to_anchor=(0., 1.05, 1., .102), loc='lower left',
+    #               ncols=1, mode="expand", borderaxespad=0.)   
+    # axs[0].set(xlim=[0,360], ylim=[250, 700])
     
-    fig.supxlabel('Heliolongitude [deg.]')
-    fig.supylabel('Solar Wind Speed [km/s]')
+    # fig.supxlabel('Heliolongitude [deg.]')
+    # fig.supylabel('Solar Wind Speed [km/s]')
         
-    plt.show()
+    # plt.show()
 
-    # %% =============================================================================
-    # PRE X: Compare 3D boundary distribution to individal backmapped results
-    # =============================================================================
-    # Remake the last plot, with comparison to 3D GP results
-    fig, axs = plt.subplots(nrows=len(inputs.boundarySources), sharex=True, sharey=True,
-                            figsize=(4, 4.5))
-    plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
-                        hspace=0)
+    # # %% =============================================================================
+    # # PRE X: Compare 3D boundary distribution to individal backmapped results
+    # # =============================================================================
+    # # Remake the last plot, with comparison to 3D GP results
+    # fig, axs = plt.subplots(nrows=len(inputs.boundarySources), sharex=True, sharey=True,
+    #                         figsize=(4, 4.5))
+    # plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
+    #                     hspace=0)
     
-    lon_grid = np.linspace(0, 360, inputs.boundaryDistributions['omni']['U_mu_grid'].shape[0])
+    # lon_grid = np.linspace(0, 360, inputs.boundaryDistributions['omni']['U_mu_grid'].shape[0])
     
-    for ax, source in zip(axs, fixed_time_lats.keys()):
+    # for ax, source in zip(axs, fixed_time_lats.keys()):
         
-        U_mu = inputs.boundaryDistributions[source]['U_mu_grid'][:,fixed_time_indx]
-        U_upper = U_mu + inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
-        U_lower = U_mu - inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
+    #     U_mu = inputs.boundaryDistributions[source]['U_mu_grid'][:,fixed_time_indx]
+    #     U_upper = U_mu + inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
+    #     U_lower = U_mu - inputs.boundaryDistributions[source]['U_sig_grid'][:,fixed_time_indx]
         
-        ax.plot(lon_grid, U_mu,
-                color='xkcd:pumpkin', lw=1.5,
-                label = 'Backmapped Data')
-        ax.fill_between(lon_grid, U_upper, U_lower,
-                        color='xkcd:pumpkin', alpha=0.33,
-                        label='95% CI')
-        bbox = dict(boxstyle="round", fc='white', ec='black',
-                    pad=0.2, alpha=0.66)
-        ax.annotate(source, (0,1), (1,-1), 
-                    'axes fraction', 'offset fontsize',
-                    color='black', ha='left', va='top',
-                    bbox=bbox)
+    #     ax.plot(lon_grid, U_mu,
+    #             color='xkcd:pumpkin', lw=1.5,
+    #             label = 'Backmapped Data')
+    #     ax.fill_between(lon_grid, U_upper, U_lower,
+    #                     color='xkcd:pumpkin', alpha=0.33,
+    #                     label='95% CI')
+    #     bbox = dict(boxstyle="round", fc='white', ec='black',
+    #                 pad=0.2, alpha=0.66)
+    #     ax.annotate(source, (0,1), (1,-1), 
+    #                 'axes fraction', 'offset fontsize',
+    #                 color='black', ha='left', va='top',
+    #                 bbox=bbox)
                
-        boundary_sample = inputs.sample_boundaryDistribution3D(source)
-        U_mu = boundary_sample['U_mu_grid'][:,fixed_time_indx]
-        U_upper = U_mu + boundary_sample['U_sig_grid'][:,fixed_time_indx]
-        U_lower = U_mu - boundary_sample['U_sig_grid'][:,fixed_time_indx]
-        ax.plot(lon_grid, U_mu,
-                color='xkcd:cerulean', lw=1.5,
-                label='3D GP Prediction')
-        ax.fill_between(lon_grid, U_upper, U_lower,
-                        color='xkcd:cerulean', alpha=0.33,
-                        label='95% CI')
+    #     boundary_sample = inputs.sample_boundaryDistribution3D(source)
+    #     U_mu = boundary_sample['U_mu_grid'][:,fixed_time_indx]
+    #     U_upper = U_mu + boundary_sample['U_sig_grid'][:,fixed_time_indx]
+    #     U_lower = U_mu - boundary_sample['U_sig_grid'][:,fixed_time_indx]
+    #     ax.plot(lon_grid, U_mu,
+    #             color='xkcd:cerulean', lw=1.5,
+    #             label='3D GP Prediction')
+    #     ax.fill_between(lon_grid, U_upper, U_lower,
+    #                     color='xkcd:cerulean', alpha=0.33,
+    #                     label='95% CI')
         
-    axs[0].legend(bbox_to_anchor=(0., 1.05, 1., .102), loc='lower left',
-                  ncols=2, mode="expand", borderaxespad=0.)   
-    axs[0].set(xlim=[0,360], ylim=[250, 700])
+    # axs[0].legend(bbox_to_anchor=(0., 1.05, 1., .102), loc='lower left',
+    #               ncols=2, mode="expand", borderaxespad=0.)   
+    # axs[0].set(xlim=[0,360], ylim=[250, 700])
     
-    fig.supxlabel('Heliolongitude [deg.]')
-    fig.supylabel('Solar Wind Speed [km/s]')
-    plt.show()
+    # fig.supxlabel('Heliolongitude [deg.]')
+    # fig.supylabel('Solar Wind Speed [km/s]')
+    # plt.show()
     
-    # %% =============================================================================
-    #     # lon-lat plot
-    # =============================================================================
-    # transparent-opaque white colorbar
-    import matplotlib.pylab as pl
-    from matplotlib.colors import ListedColormap
-    # Choose colormap
-    cmap = pl.cm.binary
-    # Get the colormap colors
-    my_cmap = cmap(np.zeros(cmap.N)) # np.arange(cmap.N))
-    # Set alpha
-    my_cmap[:,-1] = np.linspace(0, 1, cmap.N)
-    # Create new colormap
-    my_cmap = ListedColormap(my_cmap)
+    # # %% =============================================================================
+    # #     # lon-lat plot
+    # # =============================================================================
+    # # transparent-opaque white colorbar
+    # import matplotlib.pylab as pl
+    # from matplotlib.colors import ListedColormap
+    # # Choose colormap
+    # cmap = pl.cm.binary
+    # # Get the colormap colors
+    # my_cmap = cmap(np.zeros(cmap.N)) # np.arange(cmap.N))
+    # # Set alpha
+    # my_cmap[:,-1] = np.linspace(0, 1, cmap.N)
+    # # Create new colormap
+    # my_cmap = ListedColormap(my_cmap)
     
     
-    fig, ax = plt.subplots(figsize=(4,4.5))
-    plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
-                        hspace=0)
+    # fig, ax = plt.subplots(figsize=(4,4.5))
+    # plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
+    #                     hspace=0)
     
-    lons, lats = np.meshgrid(inputs.boundaryDistributions3D['lon_grid'],
-                             inputs.boundaryDistributions3D['lat_grid'])
-    pcm = ax.pcolormesh(lons, lats, 
-                        inputs.boundaryDistributions3D['U_mu_grid'][:,:,fixed_time_indx],
-                        vmin=250, vmax=600, cmap='magma')
-    ax.pcolormesh(lons, lats, 
-                  inputs.boundaryDistributions3D['U_sig_grid'][:,:,fixed_time_indx],
-                  vmin=50, vmax=150, cmap=my_cmap)
+    # lons, lats = np.meshgrid(inputs.boundaryDistributions3D['lon_grid'],
+    #                          inputs.boundaryDistributions3D['lat_grid'])
+    # pcm = ax.pcolormesh(lons, lats, 
+    #                     inputs.boundaryDistributions3D['U_mu_grid'][:,:,fixed_time_indx],
+    #                     vmin=250, vmax=600, cmap='magma')
+    # ax.pcolormesh(lons, lats, 
+    #               inputs.boundaryDistributions3D['U_sig_grid'][:,:,fixed_time_indx],
+    #               vmin=50, vmax=150, cmap=my_cmap)
     
-    cax = fig.add_axes((0.16, 1-0.125, 0.80, 0.045))
-    fig.colorbar(pcm, cax=cax, pad=0.01, location='top', label='Solar Wind Speed [km/s]')
+    # cax = fig.add_axes((0.16, 1-0.125, 0.80, 0.045))
+    # fig.colorbar(pcm, cax=cax, pad=0.01, location='top', label='Solar Wind Speed [km/s]')
 
-    for source, lat, ax_key in zip(fixed_time_lats.keys(), fixed_time_lats.values(), ['b', 'c', 'd']):
-    # for source, ax_key in zip(inputs.availableSources, ['b', 'c', 'd']):
+    # for source, lat, ax_key in zip(fixed_time_lats.keys(), fixed_time_lats.values(), ['b', 'c', 'd']):
+    # # for source, ax_key in zip(inputs.availableSources, ['b', 'c', 'd']):
         
-        ax.axhline(lat, label = source, 
-                   color='xkcd:cerulean', lw=1.5)
-        bbox = dict(boxstyle="round", fc='xkcd:cerulean', ec='xkcd:cerulean',
-                    pad=0.2, alpha=0.66)
-        ax.annotate(source, (0, lat), (1,0.5), 
-                    'data', 'offset fontsize',
-                    color='white', ha='left', va='bottom', 
-                    bbox=bbox)
+    #     ax.axhline(lat, label = source, 
+    #                color='xkcd:cerulean', lw=1.5)
+    #     bbox = dict(boxstyle="round", fc='xkcd:cerulean', ec='xkcd:cerulean',
+    #                 pad=0.2, alpha=0.66)
+    #     ax.annotate(source, (0, lat), (1,0.5), 
+    #                 'data', 'offset fontsize',
+    #                 color='white', ha='left', va='bottom', 
+    #                 bbox=bbox)
     
-    ax.set(xlim=[0,360], 
-           ylim=[-inputs.latmax.value,inputs.latmax.value])
-    fig.supxlabel('Heliolongitude [deg.]')
-    fig.supylabel('Heliolatitude [deg.]')
+    # ax.set(xlim=[0,360], 
+    #        ylim=[-inputs.latmax.value,inputs.latmax.value])
+    # fig.supxlabel('Heliolongitude [deg.]')
+    # fig.supylabel('Heliolatitude [deg.]')
 
-    plt.show()
+    # plt.show()
     
     
-    # %% =============================================================================
-    #     # lon-lat plot 2
-    # =============================================================================
-    # What latitude is the source at at this time? Now with Saturn
-    fixed_time_lats = {}
-    for source in [*inputs.boundarySources, 'saturn']:
-        fixed_time_lat = np.interp(fixed_time_mjd,
-                                   inputs.availableBackgroundData['mjd'],
-                                   inputs.availableBackgroundData[(source, 'lat_HGI')])
-        fixed_time_lats[source] = fixed_time_lat
-    fixed_time_lats = {k: v for k, v in sorted(fixed_time_lats.items(), key=lambda x: x[1], reverse=True)}
+    # # %% =============================================================================
+    # #     # lon-lat plot 2
+    # # =============================================================================
+    # # What latitude is the source at at this time? Now with Saturn
+    # fixed_time_lats = {}
+    # for source in [*inputs.boundarySources, 'saturn']:
+    #     fixed_time_lat = np.interp(fixed_time_mjd,
+    #                                inputs.availableBackgroundData['mjd'],
+    #                                inputs.availableBackgroundData[(source, 'lat_HGI')])
+    #     fixed_time_lats[source] = fixed_time_lat
+    # fixed_time_lats = {k: v for k, v in sorted(fixed_time_lats.items(), key=lambda x: x[1], reverse=True)}
     
     
-    fig, ax = plt.subplots(figsize=(4,4.5))
-    plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
-                        hspace=0)
+    # fig, ax = plt.subplots(figsize=(4,4.5))
+    # plt.subplots_adjust(bottom=(0.09), left=(0.16), top=(1-0.135), right=(1-0.04),
+    #                     hspace=0)
     
-    lons, lats = np.meshgrid(inputs.boundaryDistributions3D['lon_grid'],
-                             inputs.boundaryDistributions3D['lat_grid'])
-    pcm = ax.pcolormesh(lons, lats, 
-                        inputs.boundaryDistributions3D['U_mu_grid'][:,:,fixed_time_indx],
-                        vmin=250, vmax=600, cmap='magma')
+    # lons, lats = np.meshgrid(inputs.boundaryDistributions3D['lon_grid'],
+    #                          inputs.boundaryDistributions3D['lat_grid'])
+    # pcm = ax.pcolormesh(lons, lats, 
+    #                     inputs.boundaryDistributions3D['U_mu_grid'][:,:,fixed_time_indx],
+    #                     vmin=250, vmax=600, cmap='magma')
     
-    ax.pcolormesh(lons, lats, 
-                  inputs.boundaryDistributions3D['U_sig_grid'][:,:,fixed_time_indx],
-                  vmin=50, vmax=150, cmap=my_cmap)
+    # ax.pcolormesh(lons, lats, 
+    #               inputs.boundaryDistributions3D['U_sig_grid'][:,:,fixed_time_indx],
+    #               vmin=50, vmax=150, cmap=my_cmap)
     
     
-    cax = fig.add_axes((0.16, 1-0.125, 0.80, 0.045))
-    fig.colorbar(pcm, cax=cax, pad=0.01, location='top', label='Solar Wind Speed [km/s]')
+    # cax = fig.add_axes((0.16, 1-0.125, 0.80, 0.045))
+    # fig.colorbar(pcm, cax=cax, pad=0.01, location='top', label='Solar Wind Speed [km/s]')
 
-    for source, lat in zip(fixed_time_lats.keys(), fixed_time_lats.values()):
-    # for source, ax_key in zip(inputs.availableSources, ['b', 'c', 'd']):
+    # for source, lat in zip(fixed_time_lats.keys(), fixed_time_lats.values()):
+    # # for source, ax_key in zip(inputs.availableSources, ['b', 'c', 'd']):
         
-        ax.axhline(lat, 
-                   color='xkcd:cerulean', lw=1.5)
-        bbox = dict(boxstyle="round", fc='xkcd:cerulean', ec='xkcd:cerulean',
-                    pad=0.2, alpha=0.66)
-        ax.annotate(source, (0, lat), (1,0.5), 
-                    'data', 'offset fontsize',
-                    color='white', ha='left', va='bottom', 
-                    bbox=bbox)
+    #     ax.axhline(lat, 
+    #                color='xkcd:cerulean', lw=1.5)
+    #     bbox = dict(boxstyle="round", fc='xkcd:cerulean', ec='xkcd:cerulean',
+    #                 pad=0.2, alpha=0.66)
+    #     ax.annotate(source, (0, lat), (1,0.5), 
+    #                 'data', 'offset fontsize',
+    #                 color='white', ha='left', va='bottom', 
+    #                 bbox=bbox)
     
-    # Add CMEs
-    cme_mjds = inputs.cmeDistribution['t_mu']/(24*3600) + inputs.simstarttime.mjd
-    cme_delta = 5
-    interaction_cme_indx = (cme_mjds > Time(interaction_time).mjd-cme_delta) & (cme_mjds < Time(interaction_time).mjd+cme_delta)
-    interaction_cmes = inputs.cmeDistribution.loc[interaction_cme_indx, :]
+    # # Add CMEs
+    # cme_mjds = inputs.cmeDistribution['t_mu']/(24*3600) + inputs.simstarttime.mjd
+    # cme_delta = 5
+    # interaction_cme_indx = (cme_mjds > Time(interaction_time).mjd-cme_delta) & (cme_mjds < Time(interaction_time).mjd+cme_delta)
+    # interaction_cmes = inputs.cmeDistribution.loc[interaction_cme_indx, :]
     
-    ax.scatter(interaction_cmes['lon_mu']%360, interaction_cmes['lat_mu'], 
-               color = 'xkcd:kelly green', marker='o', fc='None', s=512, lw=2,
-               label = 'CME')
+    # ax.scatter(interaction_cmes['lon_mu']%360, interaction_cmes['lat_mu'], 
+    #            color = 'xkcd:kelly green', marker='o', fc='None', s=512, lw=2,
+    #            label = 'CME')
         
-    ax.legend(loc='upper right', markerscale=1/10)
+    # ax.legend(loc='upper right', markerscale=1/10)
     
-    ax.set(xlim=[0,360], 
-           ylim=[-inputs.latmax.value,inputs.latmax.value])
-    fig.supxlabel('Heliolongitude [deg.]')
-    fig.supylabel('Heliolatitude [deg.]')
+    # ax.set(xlim=[0,360], 
+    #        ylim=[-inputs.latmax.value,inputs.latmax.value])
+    # fig.supxlabel('Heliolongitude [deg.]')
+    # fig.supylabel('Heliolatitude [deg.]')
 
-    plt.show()
+    # plt.show()
     
-    # %% =============================================================================
-    # Saturn pre-SIR
-    # =============================================================================
-    import scipy
-    fig, axs = plt.subplots(nrows=2, figsize=[6, 4.5], sharex=True, sharey=True)
-    plt.subplots_adjust(bottom=(0.15), left=(0.12), top=(1-0.045), right=(1-0.12),
-                        hspace=0.1)
+    # # %% =============================================================================
+    # # Saturn pre-SIR
+    # # =============================================================================
+    # import scipy
+    # fig, axs = plt.subplots(nrows=2, figsize=[6, 4.5], sharex=True, sharey=True)
+    # plt.subplots_adjust(bottom=(0.15), left=(0.12), top=(1-0.045), right=(1-0.12),
+    #                     hspace=0.1)
     
-    axs[0].set(ylim=[0,8e8])
-    for source in ['saturn']:
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_RH_core')],
-                color='red', lw=0.5, zorder=-10, alpha=0.10,  
-                label='1-hour')
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
-                color='red', lw=1.0, zorder=-10, alpha=1.0,  
-                label='10-hour')
-        axs[0].legend(loc='upper right')
+    # axs[0].set(ylim=[0,8e8])
+    # for source in ['saturn']:
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_RH_core')],
+    #             color='red', lw=0.5, zorder=-10, alpha=0.10,  
+    #             label='1-hour')
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
+    #             color='red', lw=1.0, zorder=-10, alpha=1.0,  
+    #             label='10-hour')
+    #     axs[0].legend(loc='upper right')
         
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_LH_core')],
-                color='black', lw=0.5, zorder=-10, alpha=0.10, 
-                label='1-hour')
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_LH_core')],
+    #             color='black', lw=0.5, zorder=-10, alpha=0.10, 
+    #             label='1-hour')
         
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
-                color='black', lw=1.0, zorder=-10, alpha=1.0, 
-                label='10-hour')
-        axs[1].legend(loc='upper right')
-        
-    
-    axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Right-hand Polarized')
-    axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Left-hand Polarized')
-    
-    axs12 = axs[1].secondary_xaxis(-0.115, 
-                functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
-    axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
-    
-    fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
-    
-    for ax in axs: 
-        ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
-    
-    ensemble = inputs.current_ensemble
-    source = 'saturn'
-    
-    weights = [1/len(ensemble)] * len(ensemble)
-    weights = np.array(weights)
-    metamodel = inputs.estimate(ensemble, weights)
-    for ax in axs:
-        twin_ax = ax.twinx()
-        
-        for member in ensemble:
-            twin_ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.20, zorder=2, lw=1)
-        
-        twin_ax.plot(metamodel['mjd'], metamodel['U_median'], color='xkcd:royal blue', alpha=1, lw=1.5, zorder=10,
-                     label = 'Ensemble')
-        twin_ax.fill_between(metamodel['mjd'], metamodel['U_upper95'], metamodel['U_lower95'],
-                             color='xkcd:royal blue', alpha=0.33, lw=1.5, zorder=6,
-                             label = '95% CI')
-        twin_ax.set(ylim=[250,600], ylabel = 'Solar Wind Speed [km/s]')
-        twin_ax.legend(loc='upper left')
-    
-    ax.set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd])
-    
-    plt.show()
-    
-    
-    # %% =============================================================================
-    # Saturn post-SIR
-    # =============================================================================
-    import scipy
-    r = []
-    for member in ensemble:
-        ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.10, zorder=4)
-        
-        r_pershift = []
-        for iTime in range(1, 15):
-            r_pershift.append(scipy.stats.pearsonr(
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source,'P_LH_core')].iloc[:-iTime],
-                member['U'].iloc[iTime:])[0])
-        
-        r.append(np.max(r_pershift))
-        
-    r = np.array(r)
-    new_weights = (r)/(np.sum(r))
-    
-    
-    fig, axs = plt.subplots(nrows=2, figsize=[6, 4.5], sharex=True, sharey=True)
-    plt.subplots_adjust(bottom=(0.15), left=(0.12), top=(1-0.045), right=(1-0.12),
-                        hspace=0.1)
-    
-    axs[0].set(ylim=[0,8e8])
-    for source in ['saturn']:
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_RH_core')],
-                color='red', lw=0.5, zorder=-10, alpha=0.10,  
-                label='1-hour')
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
-                color='red', lw=1.0, zorder=-10, alpha=1.0,  
-                label='10-hour')
-        axs[0].legend(loc='upper right')
-        
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_LH_core')],
-                color='black', lw=0.5, zorder=-10, alpha=0.10, 
-                label='1-hour')
-        
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
-                color='black', lw=1.0, zorder=-10, alpha=1.0, 
-                label='10-hour')
-        axs[1].legend(loc='upper right')
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
+    #             color='black', lw=1.0, zorder=-10, alpha=1.0, 
+    #             label='10-hour')
+    #     axs[1].legend(loc='upper right')
         
     
-    axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Right-hand Polarized')
-    axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Left-hand Polarized')
+    # axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Right-hand Polarized')
+    # axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Left-hand Polarized')
     
-    axs12 = axs[1].secondary_xaxis(-0.115, 
-                functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
-    axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
+    # axs12 = axs[1].secondary_xaxis(-0.115, 
+    #             functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
+    # axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
     
-    fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
+    # fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
     
-    for ax in axs: 
-        ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
+    # for ax in axs: 
+    #     ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
     
-    ensemble = inputs.current_ensemble
-    source = 'saturn'
+    # ensemble = inputs.current_ensemble
+    # source = 'saturn'
     
-    metamodel = inputs.estimate(ensemble, new_weights)
-    for ax in axs:
-        twin_ax = ax.twinx()
+    # weights = [1/len(ensemble)] * len(ensemble)
+    # weights = np.array(weights)
+    # metamodel = inputs.estimate(ensemble, weights)
+    # for ax in axs:
+    #     twin_ax = ax.twinx()
         
-        for member in ensemble:
-            twin_ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.20, zorder=2, lw=1)
+    #     for member in ensemble:
+    #         twin_ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.20, zorder=2, lw=1)
         
-        twin_ax.plot(metamodel['mjd'], metamodel['U_median'], color='xkcd:royal blue', alpha=1, lw=1.5, zorder=10,
-                     label = 'Ensemble')
-        twin_ax.fill_between(metamodel['mjd'], metamodel['U_upper95'], metamodel['U_lower95'],
-                             color='xkcd:royal blue', alpha=0.33, lw=1.5, zorder=6,
-                             label = '95% CI')
-        twin_ax.set(ylim=[250,600], ylabel = 'Solar Wind Speed [km/s]')
-        twin_ax.legend(loc='upper left')
+    #     twin_ax.plot(metamodel['mjd'], metamodel['U_median'], color='xkcd:royal blue', alpha=1, lw=1.5, zorder=10,
+    #                  label = 'Ensemble')
+    #     twin_ax.fill_between(metamodel['mjd'], metamodel['U_upper95'], metamodel['U_lower95'],
+    #                          color='xkcd:royal blue', alpha=0.33, lw=1.5, zorder=6,
+    #                          label = '95% CI')
+    #     twin_ax.set(ylim=[250,600], ylabel = 'Solar Wind Speed [km/s]')
+    #     twin_ax.legend(loc='upper left')
     
-    ax.set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd])
+    # ax.set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd])
     
-    plt.show()
-
+    # plt.show()
     
-    # %% =============================================================================
-    # Saturn post-SIR Zoom out
-    # =============================================================================
-    import scipy
-    r = []
-    for member in ensemble:
-        ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.10, zorder=4)
+    
+    # # %% =============================================================================
+    # # Saturn post-SIR
+    # # =============================================================================
+    # import scipy
+    # r = []
+    # for member in ensemble:
+    #     ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.10, zorder=4)
         
-        r_pershift = []
-        for iTime in range(1, 15):
-            r_pershift.append(scipy.stats.pearsonr(
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source,'P_LH_core')].iloc[:-iTime],
-                member['U'].iloc[iTime:])[0])
+    #     r_pershift = []
+    #     for iTime in range(1, 15):
+    #         r_pershift.append(scipy.stats.pearsonr(
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source,'P_LH_core')].iloc[:-iTime],
+    #             member['U'].iloc[iTime:])[0])
         
-        r.append(np.max(r_pershift))
+    #     r.append(np.max(r_pershift))
         
-    r = np.array(r)
-    new_weights = (r)/(np.sum(r))
+    # r = np.array(r)
+    # new_weights = (r)/(np.sum(r))
     
     
-    fig, axs = plt.subplots(nrows=2, figsize=[6, 4.5], sharex=True, sharey=True)
-    plt.subplots_adjust(bottom=(0.15), left=(0.12), top=(1-0.045), right=(1-0.12),
-                        hspace=0.1)
+    # fig, axs = plt.subplots(nrows=2, figsize=[6, 4.5], sharex=True, sharey=True)
+    # plt.subplots_adjust(bottom=(0.15), left=(0.12), top=(1-0.045), right=(1-0.12),
+    #                     hspace=0.1)
     
-    axs[0].set(ylim=[0,8e8])
-    for source in ['saturn']:
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_RH_core')],
-                color='red', lw=0.5, zorder=-10, alpha=0.10,  
-                label='1-hour')
-        axs[0].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
-                color='red', lw=1.0, zorder=-10, alpha=1.0,  
-                label='10-hour')
-        axs[0].legend(loc='upper right')
+    # axs[0].set(ylim=[0,8e8])
+    # for source in ['saturn']:
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_RH_core')],
+    #             color='red', lw=0.5, zorder=-10, alpha=0.10,  
+    #             label='1-hour')
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
+    #             color='red', lw=1.0, zorder=-10, alpha=1.0,  
+    #             label='10-hour')
+    #     axs[0].legend(loc='upper right')
         
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData[(source, 'P_LH_core')],
-                color='black', lw=0.5, zorder=-10, alpha=0.10, 
-                label='1-hour')
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_LH_core')],
+    #             color='black', lw=0.5, zorder=-10, alpha=0.10, 
+    #             label='1-hour')
         
-        axs[1].plot(inputs.availableBackgroundData['mjd'], 
-                inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
-                color='black', lw=1.0, zorder=-10, alpha=1.0, 
-                label='10-hour')
-        axs[1].legend(loc='upper right')
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
+    #             color='black', lw=1.0, zorder=-10, alpha=1.0, 
+    #             label='10-hour')
+    #     axs[1].legend(loc='upper right')
         
     
-    axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Right-hand Polarized')
-    axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
-               ylabel = 'Left-hand Polarized')
+    # axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Right-hand Polarized')
+    # axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Left-hand Polarized')
     
-    axs12 = axs[1].secondary_xaxis(-0.115, 
-                functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
-    axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
+    # axs12 = axs[1].secondary_xaxis(-0.115, 
+    #             functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
+    # axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
     
-    fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
+    # fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
     
-    for ax in axs: 
-        ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
+    # for ax in axs: 
+    #     ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
     
-    ensemble = inputs.current_ensemble
-    source = 'saturn'
+    # ensemble = inputs.current_ensemble
+    # source = 'saturn'
     
-    metamodel = inputs.estimate(ensemble, new_weights)
-    for ax in axs:
-        twin_ax = ax.twinx()
+    # metamodel = inputs.estimate(ensemble, new_weights)
+    # for ax in axs:
+    #     twin_ax = ax.twinx()
         
-        for member in ensemble:
-            twin_ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.20, zorder=2, lw=1)
+    #     for member in ensemble:
+    #         twin_ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.20, zorder=2, lw=1)
         
-        twin_ax.plot(metamodel['mjd'], metamodel['U_median'], color='xkcd:royal blue', alpha=1, lw=1.5, zorder=10,
-                     label = 'Ensemble')
-        twin_ax.fill_between(metamodel['mjd'], metamodel['U_upper95'], metamodel['U_lower95'],
-                             color='xkcd:royal blue', alpha=0.33, lw=1.5, zorder=6,
-                             label = '95% CI')
-        twin_ax.set(ylim=[250,600], ylabel = 'Solar Wind Speed [km/s]')
-        twin_ax.legend(loc='upper left')
+    #     twin_ax.plot(metamodel['mjd'], metamodel['U_median'], color='xkcd:royal blue', alpha=1, lw=1.5, zorder=10,
+    #                  label = 'Ensemble')
+    #     twin_ax.fill_between(metamodel['mjd'], metamodel['U_upper95'], metamodel['U_lower95'],
+    #                          color='xkcd:royal blue', alpha=0.33, lw=1.5, zorder=6,
+    #                          label = '95% CI')
+    #     twin_ax.set(ylim=[250,600], ylabel = 'Solar Wind Speed [km/s]')
+    #     twin_ax.legend(loc='upper left')
     
-    ax.set(xlim = [inputs.simstarttime.mjd, inputs.stoptime.mjd])
+    # ax.set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd])
     
-    plt.show()
+    # plt.show()
 
     
+    # # %% =============================================================================
+    # # Saturn post-SIR Zoom out
+    # # =============================================================================
+    # import scipy
+    # r = []
+    # for member in ensemble:
+    #     ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.10, zorder=4)
+        
+    #     r_pershift = []
+    #     for iTime in range(1, 15):
+    #         r_pershift.append(scipy.stats.pearsonr(
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source,'P_LH_core')].iloc[:-iTime],
+    #             member['U'].iloc[iTime:])[0])
+        
+    #     r.append(np.max(r_pershift))
+        
+    # r = np.array(r)
+    # new_weights = (r)/(np.sum(r))
+    
+    
+    # fig, axs = plt.subplots(nrows=2, figsize=[6, 4.5], sharex=True, sharey=True)
+    # plt.subplots_adjust(bottom=(0.15), left=(0.12), top=(1-0.045), right=(1-0.12),
+    #                     hspace=0.1)
+    
+    # axs[0].set(ylim=[0,8e8])
+    # for source in ['saturn']:
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_RH_core')],
+    #             color='red', lw=0.5, zorder=-10, alpha=0.10,  
+    #             label='1-hour')
+    #     axs[0].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_RH_core')],
+    #             color='red', lw=1.0, zorder=-10, alpha=1.0,  
+    #             label='10-hour')
+    #     axs[0].legend(loc='upper right')
+        
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData[(source, 'P_LH_core')],
+    #             color='black', lw=0.5, zorder=-10, alpha=0.10, 
+    #             label='1-hour')
+        
+    #     axs[1].plot(inputs.availableBackgroundData['mjd'], 
+    #             inputs.availableBackgroundData.rolling('10h', center=True).mean()[(source, 'P_LH_core')],
+    #             color='black', lw=1.0, zorder=-10, alpha=1.0, 
+    #             label='10-hour')
+    #     axs[1].legend(loc='upper right')
+        
+    
+    # axs[0].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Right-hand Polarized')
+    # axs[1].set(xlim = [inputs.starttime.mjd, inputs.stoptime.mjd],
+    #            ylabel = 'Left-hand Polarized')
+    
+    # axs12 = axs[1].secondary_xaxis(-0.115, 
+    #             functions=(lambda x: x-inputs.starttime.mjd, lambda x: x+inputs.starttime.mjd))
+    # axs12.set(xlabel = 'MJD; Days from {}'.format(inputs.start.strftime('%Y-%m-%d %H:%M')))
+    
+    # fig.supylabel('SKR Power, Integrated (100-400 kHz) [W/sr]', size='medium')
+    
+    # for ax in axs: 
+    #     ax.axvline(Time(interaction_time).mjd, color='xkcd:fuchsia', ls='--', lw=1.5)
+    
+    # ensemble = inputs.current_ensemble
+    # source = 'saturn'
+    
+    # metamodel = inputs.estimate(ensemble, new_weights)
+    # for ax in axs:
+    #     twin_ax = ax.twinx()
+        
+    #     for member in ensemble:
+    #         twin_ax.plot(member['mjd'], member['U'], color='xkcd:cerulean', alpha=0.20, zorder=2, lw=1)
+        
+    #     twin_ax.plot(metamodel['mjd'], metamodel['U_median'], color='xkcd:royal blue', alpha=1, lw=1.5, zorder=10,
+    #                  label = 'Ensemble')
+    #     twin_ax.fill_between(metamodel['mjd'], metamodel['U_upper95'], metamodel['U_lower95'],
+    #                          color='xkcd:royal blue', alpha=0.33, lw=1.5, zorder=6,
+    #                          label = '95% CI')
+    #     twin_ax.set(ylim=[250,600], ylabel = 'Solar Wind Speed [km/s]')
+    #     twin_ax.legend(loc='upper left')
+    
+    # ax.set(xlim = [inputs.simstarttime.mjd, inputs.stoptime.mjd])
+    
+    # plt.show()
 
-    # %%
-    breakpoint()
+    
+
+    # # %%
+    # breakpoint()
 
     
-    # Read all the available assimilation data
-    # test.get_availableData()
-    # test.filter_availableData()
-    # test.sort_availableSources('rad_HGI')
+    # # Read all the available assimilation data
+    # # test.get_availableData()
+    # # test.filter_availableData()
+    # # test.sort_availableSources('rad_HGI')
     
-    # Save copies of the original distributions, for comparisons
-    original_boundaryDistribution = copy.deepcopy(test.boundaryDistribution)
-    original_cmeDistribution = copy.deepcopy(test.cmeDistribution)
+    # # Save copies of the original distributions, for comparisons
+    # original_boundaryDistribution = copy.deepcopy(test.boundaryDistribution)
+    # original_cmeDistribution = copy.deepcopy(test.cmeDistribution)
     
-    # Initial weights
+    # # Initial weights
     
     
-    # Propagate an ensemble to each source
-    for source in test.availableSources:
+    # # Propagate an ensemble to each source
+    # for source in test.availableSources:
         
-        # Step 1: (re)sample
-        boundarySamples, cmeSamples = test.sample(weights)
+    #     # Step 1: (re)sample
+    #     boundarySamples, cmeSamples = test.sample(weights)
         
-        # Step 2: forecast the solar wind
-        # Propagate the sample inputs to this source
-        ensemble = test.predict2(boundarySamples, cmeSamples, source)
-        #!!!!
+    #     # Step 2: forecast the solar wind
+    #     # Propagate the sample inputs to this source
+    #     ensemble = test.predict2(boundarySamples, cmeSamples, source)
+    #     #!!!!
         
-        # Step 3: get the new weights
-        # Calculate the new weights (goodness-of-fit) for each sample to the source
-        new_weights = test.update_weights(ensemble, weights, 10, test.availableData[source])
+    #     # Step 3: get the new weights
+    #     # Calculate the new weights (goodness-of-fit) for each sample to the source
+    #     new_weights = test.update_weights(ensemble, weights, 10, test.availableData[source])
         
-        # Step 4: estimate new background distributions from new weights
-        # !!!! Update the individual 2D distributions,
-        # !!!! then update the 3D distribution
-        test.update_distributions(new_weights, boundarySamples, cmeSamples)
+    #     # Step 4: estimate new background distributions from new weights
+    #     # !!!! Update the individual 2D distributions,
+    #     # !!!! then update the 3D distribution
+    #     test.update_distributions(new_weights, boundarySamples, cmeSamples)
         
-        weights = new_weights
+    #     weights = new_weights
 
     
         
