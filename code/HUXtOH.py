@@ -23,7 +23,7 @@ from sunpy.timeseries import TimeSeries
 from sunpy.coordinates import sun
 from astropy.time import Time
 
-sys.path.append('/Users/mrutala/projects/OHTransients/HUXt/code/')
+sys.path.append('/Users/mrutala/projects/HUXt/code/')
 sys.path.append('/Users/mrutala/projects/OHTransients/code/')
 # os.environ['PYTHONPATH'] = '/Users/mrutala/projects/OHTransients/HUXt/code/'
 # os.environ['PYTHONPATH'] = '/Users/mrutala/projects/OHTransients/code/'
