@@ -96,7 +96,10 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     
     # Get useful datetimes
     time_fmt = "%Y-%m-%dT%H:%MZ"
-    df['eventTime'] = [strptime(t, time_fmt) for t in df['eventTime'].to_list()]
+    try: 
+        df['eventTime'] = [strptime(t, time_fmt) for t in df['eventTime'].to_list()]
+    except:
+        breakpoint()
     
     for index, row in df.iterrows():
         # Flatten the instrument names
