@@ -6,6 +6,7 @@ Created on Tue Mar  4 15:14:05 2025
 @author: mrutala
 """
 import astropy.units as u
+import time
 
 def CME(start, end):
     """
@@ -17,7 +18,7 @@ def CME(start, end):
     import numpy as np
     
     strptime = datetime.datetime.strptime
-
+    
     # Construct URL for the request
     baseurl = "https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/CME"
     start_str = "?startDate=" + start.strftime("%Y-%m-%d")
@@ -28,10 +29,18 @@ def CME(start, end):
     response = requests.get(url)
     if response.status_code != 200:
         print('cannot successfully get an http response')
-        
+    
     # read the data
     print("Getting data from", url)
     df = pd.read_json(url)
+    
+    # If df is length 0, create a dummy df with same columns
+    if len(df) == 0:
+        df = pd.DataFrame(columns=['activityID', 'catalog', 'startTime', 
+                                   'instruments', 'sourceLocation',
+                                   'activeRegionNum', 'note', 'submissionTime', 
+                                   'versionId', 'link', 'cmeAnalyses', 
+                                   'linkedEvents', 'sentNotifications'])
     
     # Get useful datetimes
     time_fmt = "%Y-%m-%dT%H:%MZ"
@@ -62,8 +71,9 @@ def CME(start, end):
         else:
             row['linkedEvents'] = []
         df.loc[index] = row
-            
-    df = df.drop(index)
+    
+    # # I don't know what the purpose of this was...
+    # df = df.drop(index)
     return df
 
 def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
@@ -75,14 +85,15 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     import requests
     import datetime
     import numpy as np
+    import time
     
     strptime = datetime.datetime.strptime
-
+    
     # Construct URL for the request
     baseurl = "https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/IPS"
     start_str = "?startDate=" + start.strftime("%Y-%m-%d")
     end_str = "&endDate=" +  end.strftime("%Y-%m-%d")
-    location_str = "&location=" + location
+    location_str = "&location=" + location.replace(' ', '%20') #no space in URL
     url = baseurl + start_str + end_str + location_str
     
     # Check for a response and get the data
@@ -93,6 +104,13 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     # read the data
     print("Getting data from", url)
     df = pd.read_json(url)
+    
+    # If df is length 0, create a dummy df with same columns
+    if len(df) == 0:
+        df = pd.DataFrame(columns=['catalog', 'activityID', 'location', 
+                                   'eventTime', 'submissionTime',
+                                   'versionId', 'link', 'instruments', 
+                                   'linkedEvents', 'sentNotifications'])
     
     # Get useful datetimes
     time_fmt = "%Y-%m-%dT%H:%MZ"
@@ -110,6 +128,7 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     if ensureCME:
         delta = datetime.timedelta(days = 27)
         cme_df = CME(start - delta, end)
+        
         df['linkedEvents'] = ''
         for index, row in df.iterrows():
             matches = [row['activityID'] in l for l in cme_df['linkedEvents']]
@@ -119,7 +138,7 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
             else:
                 row['linkedEvents'] = cme_df.loc[matches, 'activityID'].values[0]
                 df.loc[index] = row
-            
+        
     # Set the duration of the event
     df['duration'] = duration
 
