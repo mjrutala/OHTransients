@@ -481,7 +481,9 @@ class multihuxt_inputs:
     #         print('</html>', file=f)
     #     return
     
-    def get_availableTransientData(self, sources=None, duration=2*u.day):
+    def get_availableTransientData(self, sources=None, duration=2):
+        
+        duration = duration * u.day
         
         location_aliases = {'omni': 'Earth',
                             'stereo a': 'STEREO%20A',
@@ -566,6 +568,7 @@ class multihuxt_inputs:
         carrington_period = 27 * u.day
         
         # Calculate the span from stop - start
+        span = (self.stop - self.start).total_seconds() * u.s
         simspan = (self.simstop - self.simstart).total_seconds() * u.s
         
         # Parse optional keywords
@@ -577,7 +580,7 @@ class multihuxt_inputs:
         
         # # 
         # if simspan > break_at:
-        n_chunks = np.ceil((simspan/break_at).decompose()).value
+        n_chunks = np.ceil((span/break_at).decompose()).value
             
         # Hold the distributions in a dict until the end
         backgroundDistributions_dict = {}
@@ -615,29 +618,52 @@ class multihuxt_inputs:
                 # Break the resulting df into chunks of size break_at, then loop
                 insitu_noICME_chunks = []
                 for i in range(int(n_chunks)):
-                    chunk = insitu_noICME.iloc[int(i*break_at.value):int((i+1)*break_at.value)]
+                    # chunk = insitu_noICME.iloc[int(i*break_at.value):int((i+1)*break_at.value)]
+                    
+                    # More sophisticated: ensure there's padding on either side of chunk
+                    chunk_starttime = self.starttime + i*break_at
+                    chunk_stoptime = self.starttime + (i+1)*break_at
+                    
+                    chunk_simstarttime = chunk_starttime - self.simpadding[0]
+                    chunk_simstoptime = chunk_stoptime + self.simpadding[1]
+                    
+                    chunk = insitu_noICME.query("@chunk_simstarttime.mjd <= mjd < @chunk_simstoptime.mjd")
+                    
                     insitu_noICME_chunks.append(chunk)
+                
+                for i, chunk in enumerate(insitu_noICME_chunks):
                     
-                for insitu_noICME in insitu_noICME_chunks:
-                    
-                    new_insitu, sample_func = self.ambient_solar_wind_GP(insitu_noICME, 
+                    # Perform the GPR
+                    new_insitu, sample_func = self.ambient_solar_wind_GP(chunk, 
                                                                          average_cluster_span, 
                                                                          carrington_period,
                                                                          inducing_variable=inducing_variable)
                     
+                    # Retrieve the starttime and stoptime by un-padding
+                    if i == 0:
+                        chunk_starttime_mjd = self.simstarttime.mjd
+                    else:
+                        chunk_starttime_mjd = new_insitu['mjd'].iloc[0] + self.simpadding[0].to(u.day).value
+                    if i == (n_chunks-1):
+                        chunk_stoptime_mjd = self.simstoptime.mjd
+                    else:
+                        chunk_stoptime_mjd = new_insitu['mjd'].iloc[-1] - self.simpadding[1].to(u.day).value
+                    
+                    new_insitu.query("@chunk_starttime_mjd <= mjd <= @chunk_stoptime_mjd", inplace=True)
+                    
                     new_insitu_list.append(new_insitu)
-                    sample_func_list.append(sample_func)
+                    # sample_func_list.append(sample_func)
             
             # Concatenate chunks back together and add to dict
             new_insitu = pd.concat(new_insitu_list)
             backgroundDistributions_dict[source] = new_insitu
-            backgroundSamplers_dict[source] = sample_func_list
+            # backgroundSamplers_dict[source] = sample_func_list
         
         backgroundDistributions = pd.concat(backgroundDistributions_dict,
                                             axis='columns')
         self.backgroundDistributions = backgroundDistributions
         self.backgroundDistributions['mjd'] = self.availableBackgroundData['mjd']
-        self.backgroundSamplers = backgroundSamplers_dict
+        # self.backgroundSamplers = backgroundSamplers_dict
         
         # =============================================================================
         # Visualization
