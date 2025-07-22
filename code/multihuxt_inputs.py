@@ -125,6 +125,9 @@ class multihuxt_inputs:
         self.SiderealCarringtonRotation = 27.28 * u.day
         self.SynodicCarringtonRotation = 25.38 * u.day
         
+        # Required initializations
+        self._boundarySources = None
+        
         # Input data initialization
         cols = ['t_mu', 't_sig', 'lon_mu', 'lon_sig', 'lat_mu', 'lat_sig',
                 'width_mu', 'width_sig', 'speed_mu', 'speed_sig', 
@@ -170,13 +173,22 @@ class multihuxt_inputs:
         availableSources = set(availableSources) - {'mjd'}
         return sorted(availableSources)
         
+    # @property
+    # def boundarySources(self):
+    #     # # If the time span is short enough that no ICMEs are measured
+    #     # boundarySources = set(self.availableTransientData['affiliated_source'])
+    #     # Temporary fix: hardcoding
+    #     boundarySources = {'omni', 'stereo a', 'stereo b'}
+    #     return sorted(boundarySources)
     @property
     def boundarySources(self):
-        # # If the time span is short enough that no ICMEs are measured
-        # boundarySources = set(self.availableTransientData['affiliated_source'])
-        # Temporary fix: hardcoding
-        boundarySources = {'omni', 'stereo a', 'stereo b'}
-        return sorted(boundarySources)
+        if self._boundarySources is None:
+            self._boundarySources = ['omni', 'stereo a', 'stereo b']
+        return self._boundarySources
+    
+    @boundarySources.setter
+    def boundarySources(self, boundarySources):
+        self._boundarySources = boundarySources
     
     def copy(self):
         return copy.deepcopy(self)
@@ -536,7 +548,10 @@ class multihuxt_inputs:
         insitu = self.availableBackgroundData[source]
         insitu['mjd'] = self.availableBackgroundData['mjd']
         
-        # Get the list of ICMEs at this source
+        # Interpolate over existing data gaps (NaNs), so they aren't caught as ICMEs
+        insitu.interpolate(method='linear', axis='columns', limit_direction='both', inplace=True)
+        
+        # Get ICMEs
         icmes = self.availableTransientData.query('affiliated_source == @source')
         icmes.reset_index(inplace=True, drop=True)
         
@@ -544,7 +559,6 @@ class multihuxt_inputs:
         if 'eventTime' in icmes.columns: 
             icmes = icmes.rename(columns = {'eventTime': 'Shock_time'})
             icmes['ICME_end'] = [row['Shock_time'] + datetime.timedelta(days=(row['duration'])) for _, row in icmes.iterrows()]
-        
         
         if len(icmes) > 0:
             insitu_noicme = Hin.remove_ICMEs(insitu, icmes, 
@@ -578,7 +592,6 @@ class multihuxt_inputs:
             break_at *= u.hour   
         average_cluster_span *= u.hour
         
-        # # 
         # if simspan > break_at:
         n_chunks = np.ceil((span/break_at).decompose()).value
             
@@ -599,71 +612,71 @@ class multihuxt_inputs:
             insitu_noICME.loc[indexICME, ['U', 'BR']] = np.nan
             
             new_insitu_list = []
-            sample_func_list = []
-            if simple:
-                print("Skipping GPR!")
-                # Plain interpolation
-                new_insitu = insitu_noICME.copy(deep=True)
-                new_insitu.interpolate('time', axis=0, inplace=True, limit_direction='both')
+            sample_func_df = pd.DataFrame(columns=['start_mjd', 'stop_mjd', 'func'])
+            
+            # Break the resulting df into chunks of size break_at, then loop
+            insitu_noICME_chunks = []
+            for i in range(int(n_chunks)):
+                # chunk = insitu_noICME.iloc[int(i*break_at.value):int((i+1)*break_at.value)]
                 
-                # Guess at an approximate uncertainty
-                new_insitu['U_mu'] = new_insitu['U']
-                new_insitu['U_sig'] = new_insitu.rolling('1d').std()['U'].mean()
-                new_insitu.loc[~indexICME, 'U_sig'] *= 1/10. 
+                # More sophisticated: ensure there's padding on either side of chunk
+                chunk_starttime = self.starttime + i*break_at
+                chunk_stoptime = self.starttime + (i+1)*break_at
                 
-                new_insitu.drop(columns='U', inplace=True)
-                new_insitu_list.append(new_insitu)
+                chunk_simstarttime = chunk_starttime - self.simpadding[0]
+                chunk_simstoptime = chunk_stoptime + self.simpadding[1]
                 
-            else:
-                # Break the resulting df into chunks of size break_at, then loop
-                insitu_noICME_chunks = []
-                for i in range(int(n_chunks)):
-                    # chunk = insitu_noICME.iloc[int(i*break_at.value):int((i+1)*break_at.value)]
-                    
-                    # More sophisticated: ensure there's padding on either side of chunk
-                    chunk_starttime = self.starttime + i*break_at
-                    chunk_stoptime = self.starttime + (i+1)*break_at
-                    
-                    chunk_simstarttime = chunk_starttime - self.simpadding[0]
-                    chunk_simstoptime = chunk_stoptime + self.simpadding[1]
-                    
-                    chunk = insitu_noICME.query("@chunk_simstarttime.mjd <= mjd < @chunk_simstoptime.mjd")
-                    
-                    insitu_noICME_chunks.append(chunk)
+                chunk = insitu_noICME.query("@chunk_simstarttime.mjd <= mjd < @chunk_simstoptime.mjd")
                 
-                for i, chunk in enumerate(insitu_noICME_chunks):
+                insitu_noICME_chunks.append(chunk)
+            
+            for i, chunk in enumerate(insitu_noICME_chunks):
                     
+                # Option #1: Simple linear interpolation
+                if simple:
+                    print("Skipping GPR!")
+                    new_insitu, sample_func = self.ambient_solar_wind_LI(chunk)
+                
+                # Options #2: Gaussian Process Regression
+                else:
                     # Perform the GPR
+                    if chunk['U'].isna().all():
+                        breakpoint()
                     new_insitu, sample_func = self.ambient_solar_wind_GP(chunk, 
                                                                          average_cluster_span, 
                                                                          carrington_period,
                                                                          inducing_variable=inducing_variable)
+                    if new_insitu is None:
+                        breakpoint()
                     
-                    # Retrieve the starttime and stoptime by un-padding
-                    if i == 0:
-                        chunk_starttime_mjd = self.simstarttime.mjd
-                    else:
-                        chunk_starttime_mjd = new_insitu['mjd'].iloc[0] + self.simpadding[0].to(u.day).value
-                    if i == (n_chunks-1):
-                        chunk_stoptime_mjd = self.simstoptime.mjd
-                    else:
-                        chunk_stoptime_mjd = new_insitu['mjd'].iloc[-1] - self.simpadding[1].to(u.day).value
-                    
-                    new_insitu.query("@chunk_starttime_mjd <= mjd <= @chunk_stoptime_mjd", inplace=True)
-                    
-                    new_insitu_list.append(new_insitu)
-                    # sample_func_list.append(sample_func)
+                # Retrieve the starttime and stoptime by un-padding
+                if i == 0:
+                    chunk_starttime_mjd = self.simstarttime.mjd
+                else:
+                    chunk_starttime_mjd = new_insitu['mjd'].iloc[0] + self.simpadding[0].to(u.day).value
+                if i == (n_chunks-1):
+                    chunk_stoptime_mjd = self.simstoptime.mjd
+                else:
+                    chunk_stoptime_mjd = new_insitu['mjd'].iloc[-1] - self.simpadding[1].to(u.day).value
+                
+                new_insitu.query("@chunk_starttime_mjd <= mjd <= @chunk_stoptime_mjd", inplace=True)
+                
+                # def new_func(num_samples):
+                #     return sample_func(new_insitu['mjd'].to_numpy(), num_samples)
+                
+                new_insitu_list.append(new_insitu)
+                sample_func_df.loc[i] = [chunk_starttime_mjd, chunk_stoptime_mjd, sample_func]
             
             # Concatenate chunks back together and add to dict
-            new_insitu = pd.concat(new_insitu_list)
-            backgroundDistributions_dict[source] = new_insitu
-            # backgroundSamplers_dict[source] = sample_func_list
+            new_insitu_combined = pd.concat(new_insitu_list)
+            backgroundDistributions_dict[source] = new_insitu_combined
+            backgroundSamplers_dict[source] = sample_func_df
         
         backgroundDistributions = pd.concat(backgroundDistributions_dict,
                                             axis='columns')
         self.backgroundDistributions = backgroundDistributions
         self.backgroundDistributions['mjd'] = self.availableBackgroundData['mjd']
-        # self.backgroundSamplers = backgroundSamplers_dict
+        self.backgroundSamplers = pd.concat(backgroundSamplers_dict, axis=1)
         
         # =============================================================================
         # Visualization
@@ -746,6 +759,9 @@ class multihuxt_inputs:
         import gpflow
         from sklearn.cluster import KMeans
         
+        if df['U'].isna().all() == True:
+            return None, None
+        
         new_insitu = df.copy(deep=True)
         new_insitu.drop(columns='U', inplace=True)
         
@@ -813,7 +829,7 @@ class multihuxt_inputs:
             period_rescaled = carrington_period.to(u.day).value
             signal_kernel = gpflow.kernels.RationalQuadratic() + \
                             gpflow.kernels.RationalQuadratic() * \
-                            gpflow.kernels.Periodic(gpflow.kernels.RationalQuadratic(),
+                            gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(),
                                                     period=gpflow.Parameter(period_rescaled, trainable=False)) 
             
             # This model *could* be solved with the exact noise for each point...
@@ -834,9 +850,6 @@ class multihuxt_inputs:
             
             # gpflow.utilities.print_summary(model)
             
-            # Xp = np.arange(qomni_df['mjd'].iloc[0], qomni_df['mjd'].iloc[-1]+30, 1)[:, None]
-            # Xo = self.availableBackgroundData['mjd'].to_numpy(float)[:, None]
-            # Xoc = mjd_rescaler.transform(Xo)
             Xo = mjd_rescaler.transform(df['mjd'].to_numpy()[:, None])
             
             Yo_mu, Yo_var = model.predict_y(Xo)
@@ -852,19 +865,81 @@ class multihuxt_inputs:
             new_insitu[var_str+'_sig'] = new_var_sig.ravel()
             
             # Replace non-ICME regions with real data
-            noNaN_bool = ~df[var_str].isna()
-            new_insitu.loc[noNaN_bool, 'U_mu'] = df.loc[noNaN_bool, 'U']
-            new_insitu.loc[noNaN_bool, 'U_sig'] *= 1/10.
+            # noNaN_bool = ~df[var_str].isna()
+            # new_insitu.loc[noNaN_bool, 'U_mu'] = df.loc[noNaN_bool, 'U']
+            # new_insitu.loc[noNaN_bool, 'U_sig'] *= 1/10.
             
             # Save a function to generate samples of f with full covariance
-            def func(num_samples):
-                foc = model.predict_f_samples(Xo, num_samples, full_cov=True)
-                fo_samples = np.array([var_rescaler.inverse_transform(f) for f in foc])
+            def func(mjd, num_samples):
+                X = mjd_rescaler.transform(mjd[:,None])
+                foc = model.predict_f_samples(X, num_samples, full_cov=True)
+                fo_samples = np.array([var_rescaler.inverse_transform(f).ravel() for f in foc])
                 return fo_samples
         
         return new_insitu, func
-                    
     
+    def ambient_solar_wind_LI(self, df):
+        
+        
+        new_insitu = df.copy(deep=True)
+        new_insitu.drop(columns='U', inplace=True)
+        
+        for var_str in ['U']: # ['U', 'BR']:
+            
+            new_insitu['U_mu'] = df[var_str].interpolate(limit_direction=None)
+            new_insitu['U_sig'] = new_insitu['U_mu'].rolling('1d').std()
+
+            # # Replace non-ICME regions with real data
+            # noNaN_bool = ~df[var_str].isna()
+            # new_insitu.loc[noNaN_bool, 'U_mu'] = df.loc[noNaN_bool, 'U']
+            # new_insitu.loc[noNaN_bool, 'U_sig'] *= 1/10.
+            
+            # # Save a function to generate samples of f with full covariance
+            def func(mjd, num_samples):
+                fo_samples = []
+                for _ in range(num_samples):
+                    sample = new_insitu.query("@mjd[0] <= mjd <= @mjd[-1]")[var_str+'_mu']
+                    fo_samples.append(sample)
+                fo_samples = np.array(fo_samples)
+                return fo_samples
+        
+        return new_insitu, func
+                 
+    def generate_backgroundSamples(self, num_samples):
+        
+        # Check that the sampler functions have been defined
+        try: 
+            keys = self.backgroundSamplers.keys()
+        except:
+            print("generate_backgroundDistributions() must be run before background samples can be generated")
+        
+        # Check if we've already generated some samples?
+        
+        
+        # Create a list of num_samples dfs to populate
+        sample_list = [self.backgroundDistributions.copy(deep=True) for _ in range(num_samples)]
+        
+        #
+        for source in self.boundarySources:
+            for i, row in tqdm.tqdm(self.backgroundSamplers[source].iterrows(), desc="Sampling for {}".format(source), total=num_samples):
+                
+                # Get MJD array to feed into function
+                sample = self.backgroundDistributions.query("@row['start_mjd'] <= `('mjd', '')` < @row['stop_mjd']")
+                sample_mjd = sample['mjd']
+                
+                result_list = row['func'](sample_mjd.to_numpy(float), num_samples)
+                for j, result in enumerate(result_list):
+                    
+                    # Add to list of dfs
+                    sample_list[j].loc[sample.index, (source, 'U_mu')] = result
+                    
+                    # Keep the uncertainties the same
+                    # result_list[i].loc[sample.index, (source, 'U_sig')] = 
+                    
+        self.backgroundSamples = sample_list
+  
+        return
+        
     def generate_boundaryDistributions(self, nSamples=16, constant_sig=0):
         from tqdm import tqdm
         # from dask.distributed import Client, as_completed, LocalCluster
@@ -880,40 +955,40 @@ class multihuxt_inputs:
         methodOptions = ['forward', 'back', 'both']
         # methodOptions = ['both']
         
-        # Define an inner function to be run in parallel
-        def map_vBoundaryInwards(source, insitu_df, corot_type):
+        # # Define an inner function to be run in parallel
+        # def map_vBoundaryInwards(source, insitu_df, corot_type):
             
-            # Generate the Carrington grids
-            t, vcarr, bcarr = Hin.generate_vCarr_from_insitu(self.simstart, self.simstop, 
-                                                             insitu_source=source, insitu_input=insitu_df, 
-                                                             corot_type=corot_type)
+        #     # Generate the Carrington grids
+        #     t, vcarr, bcarr = Hin.generate_vCarr_from_insitu(self.simstart, self.simstop, 
+        #                                                      insitu_source=source, insitu_input=insitu_df, 
+        #                                                      corot_type=corot_type)
 
             
-            # Map to 210 solar radii, then to the inner boundary for the model
-            vcarr_210 = vcarr.copy()
-            vcarr_21p5 = vcarr.copy()
-            for i, _ in enumerate(t):
+        #     # Map to 210 solar radii, then to the inner boundary for the model
+        #     vcarr_210 = vcarr.copy()
+        #     vcarr_21p5 = vcarr.copy()
+        #     for i, _ in enumerate(t):
                 
-                # vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s, 
-                #                                             (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad), 
-                #                                             210 * u.solRad)
+        #         # vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s, 
+        #         #                                             (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad), 
+        #         #                                             210 * u.solRad)
                 
-                # vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
-                #                                              210 * u.solRad,
-                #                                              self.innerbound)
+        #         # vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
+        #         #                                              210 * u.solRad,
+        #         #                                              self.innerbound)
                 
-                vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s,
-                                                             (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad),
-                                                             self.innerbound)
+        #         vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s,
+        #                                                      (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad),
+        #                                                      self.innerbound)
                 
                 
-            return vcarr_21p5
+        #     return vcarr_21p5
         
         
         boundaryDistributions_dict = {}
         for source in self.boundarySources:
         
-        # Format the insitu df (backgroundDistribution) as HUXt expects it
+            # Format the insitu df (backgroundDistribution) as HUXt expects it
             insitu_df = self.backgroundDistributions[source].copy(deep=True)
             insitu_df['BX_GSE'] =  -insitu_df['BR']
             insitu_df['V'] = insitu_df['U_mu']
@@ -1000,25 +1075,41 @@ class multihuxt_inputs:
             # del futures
             
             # Calculate boundary distributions by backmapping each sample
-            def process_sample(U_sample, method_sample):
-                insitu_df_copy = insitu_df.copy(deep=True)
-                insitu_df_copy['V'] = U_sample
-                return map_vBoundaryInwards(source, insitu_df_copy, method_sample)
+            # def process_sample(U_sample, method_sample):
+            #     insitu_df_copy = insitu_df.copy(deep=True)
+            #     insitu_df_copy['V'] = U_sample
+            #     return map_vBoundaryInwards(source, insitu_df_copy, method_sample)
             
             # Sample the velocity distribution and assign random mapping directions (method)
             # Randomly assigning these is equivalent to performing each mapping for each sample (for large numbers of samples)
             # Having a single random population should be better mathematically
-            uSamples = [rng.normal(loc=insitu_df['U_mu'], 
-                                   scale=insitu_df['U_sig']
-                                   ) for _ in range(nSamples)]
             
-            methodSamples = rng.choice(methodOptions, nSamples)
+           
             
-            vcarrGenerator = Parallel(return_as='generator', n_jobs=nCores)(
-                delayed(process_sample)(u, method) 
-                for u, method in zip(uSamples, methodSamples)
-                )
-            vcarrSamples = list(tqdm(vcarrGenerator, total=nSamples))
+            dfSamples = [df[source] for df in self.backgroundSamples]
+            methodSamples = rng.choice(methodOptions, len(dfSamples))
+            
+            breakpoint()
+            
+            func = _map_vBoundaryInwards
+            funcGenerator = Parallel(return_as='generator', n_jobs=nCores)(
+                delayed(func)(self.simstart, self.simstop, source, df_sample, method_sample, self.innerbound)
+                for df_sample, method_sample in zip(dfSamples, methodSamples))
+            
+            results = list(tqdm(funcGenerator, total=len(dfSamples)))
+            breakpoint()
+            
+            # uSamples = [rng.normal(loc=insitu_df['U_mu'], 
+            #                        scale=insitu_df['U_sig']
+            #                        ) for _ in range(nSamples)]
+            
+            # methodSamples = rng.choice(methodOptions, nSamples)
+            
+            # vcarrGenerator = Parallel(return_as='generator', n_jobs=nCores, background='threading')(
+            #     delayed(process_sample)(u, method) 
+            #     for u, method in zip(uSamples, methodSamples)
+            #     )
+            # vcarrSamples = list(tqdm(vcarrGenerator, total=nSamples))
     
             # Characterize the resulting samples as one distribution
             vcarr_mu = np.mean(vcarrSamples, axis=0)
@@ -1789,6 +1880,34 @@ class multihuxt_inputs:
                     metamodel.loc[index, col] = weighted_median
         
         return metamodel
+    
+
+# Define an inner function to be run in parallel
+def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, innerbound):
+    
+    # Reformat for HUXt inputs expectation
+    insitu_df['BX_GSE'] =  -insitu_df['BR']
+    insitu_df['V'] = insitu_df['U_mu']
+    insitu_df['datetime'] = insitu_df.index
+    insitu_df = insitu_df.reset_index()
+    
+    # Generate the Carrington grids
+    t, vcarr, bcarr = Hin.generate_vCarr_from_insitu(simstart, simstop, 
+                                                     insitu_source=source, insitu_input=insitu_df, 
+                                                     corot_type=corot_type)
+    
+    # Map to 210 solar radii, then to the inner boundary for the model
+    vcarr_inner = vcarr.copy()
+    for i, _ in enumerate(t):
+        vcarr_inner[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s,
+                                                     (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad),
+                                                     innerbound)
+    return vcarr_inner
+
+# def _process_sample(df_sample, method_sample):
+#     sf_sample_copy = df_sample.copy(deep=True)
+#     insitu_df_copy['V'] = U_sample
+#     return map_vBoundaryInwards(source, insitu_df_copy, method_sample)
 
 # # %%
 # if __name__ == '__main__':
