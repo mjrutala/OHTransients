@@ -999,97 +999,13 @@ class multihuxt_inputs:
             # t, vcarr, bcarr = Hin.generate_vCarr_from_OMNI(self.simstart, self.simstop, omni_input=insitu_df)
             t, vcarr, bcarr = Hin.generate_vCarr_from_insitu(self.simstart, self.simstop, 
                                                              insitu_source=source, insitu_input=insitu_df)
-        
-            # # Dask client for monitoring & worker setup
-            # from dask.distributed import Client
-            # client = Client(threads_per_worker=1, n_workers=8)
-            # print(client.dashboard_link)
-            
-            # # Random generator to resample U from the backgroundDistribution
-            # rng = np.random.default_rng()
-            # delayed_results = []
-            # for _ in range(nSamples):
-            #     _insitu_df_copy = _insitu_df.copy(deep=True)
-            #     _insitu_df_copy['V'] = rng.normal(loc=_insitu_df['U_mu'], scale=_insitu_df['U_sig'])
-            #     delayed_results.append(map_vBoundaryInwards(_insitu_df_copy, 'back'))
-            #     delayed_results.append(map_vBoundaryInwards(_insitu_df_copy, 'forward'))
-            #     delayed_results.append(map_vBoundaryInwards(_insitu_df_copy, 'both'))
-            
-            # # Compute the delayed results
-            # with dask.config.set({'distributed.admin.tick.limit': '60s'}):
-            #     vcarrs = dask.compute(delayed_results)[0]
-            
-            # # Characterize the resulting samples as one distribution
-            # vcarr_mu = np.mean(vcarrs, axis=0)
-            # vcarr_sig = np.sqrt(np.std(vcarrs, axis=0)**2 + constant_sig**2)
-            
-            # # self.backgroundDistribution = {'t': time_omni,
-            # #                                'u_mu': vgrids_dict['mu'], 
-            # #                                'u_sig': (vgrids_dict['mu+sig'] - vgrids_dict['mu-sig'])/2,
-            # #                                'B': bcarr_omni}
-            
-            # breakpoint()
-
-            # dask.config.set({
-            #                 'distributed.logging.distributed': 'error',
-            #                 'distributed.logging.distributed.core': 'error', 
-            #                 'distributed.logging.distributed.worker': 'error',
-            #                 'distributed.logging.distributed.scheduler': 'error',
-            #                 'distributed.admin.log-level': 'error'
-            #             })
-            
-            # with dask.config.set({'distributed.admin.tick.limit': '60s'}):
-        
-            #     # logging.getLogger('dask').setLevel(logging.WARNING)
-            #     # logging.getLogger('distributed').setLevel(logging.WARNING)
-    
-                
-            #     cluster = LocalCluster(n_workers=n_cores, 
-            #                            threads_per_worker=1, 
-            #                            silence_logs=logging.ERROR, 
-            #                            dashboard_address=None
-            #                            )
-            #     client = Client(cluster)
-                
-            #     futures = []
-            #     for _ in range(nSamples):
-                    
-            #         _insitu_df_copy = _insitu_df.copy(deep=True)
-            #         _insitu_df_copy['V'] = rng.normal(loc=_insitu_df['U_mu'], scale=_insitu_df['U_sig'])
-                    
-            #         # delayed_results.append(map_vBoundaryInwards(_insitu_df_copy, 'back'))
-            #         # delayed_results.append(map_vBoundaryInwards(_insitu_df_copy, 'forward'))
-            #         # delayed_results.append(map_vBoundaryInwards(_insitu_df_copy, 'both'))
-                    
-            #         future = client.submit(map_vBoundaryInwards, _insitu_df_copy, 'both')
-                    
-            #         futures.append(future)
-                
-            # # Append the results
-            # ordered_dict = {}
-            # for future, result in tqdm(as_completed(futures, with_results=True), total=len(futures)):
-            #     ordered_dict[future.key] = result
-        
-            # # Now reorder them based on the original futures order
-            # ordered_list = [ordered_dict[future.key] for future in futures]
-            # del futures
-            
-            # Calculate boundary distributions by backmapping each sample
-            # def process_sample(U_sample, method_sample):
-            #     insitu_df_copy = insitu_df.copy(deep=True)
-            #     insitu_df_copy['V'] = U_sample
-            #     return map_vBoundaryInwards(source, insitu_df_copy, method_sample)
             
             # Sample the velocity distribution and assign random mapping directions (method)
             # Randomly assigning these is equivalent to performing each mapping for each sample (for large numbers of samples)
             # Having a single random population should be better mathematically
             
-           
-            
             dfSamples = [df[source] for df in self.backgroundSamples]
             methodSamples = rng.choice(methodOptions, len(dfSamples))
-            
-            breakpoint()
             
             func = _map_vBoundaryInwards
             funcGenerator = Parallel(return_as='generator', n_jobs=nCores)(
@@ -1097,7 +1013,6 @@ class multihuxt_inputs:
                 for df_sample, method_sample in zip(dfSamples, methodSamples))
             
             results = list(tqdm(funcGenerator, total=len(dfSamples)))
-            breakpoint()
             
             # uSamples = [rng.normal(loc=insitu_df['U_mu'], 
             #                        scale=insitu_df['U_sig']
@@ -1112,8 +1027,8 @@ class multihuxt_inputs:
             # vcarrSamples = list(tqdm(vcarrGenerator, total=nSamples))
     
             # Characterize the resulting samples as one distribution
-            vcarr_mu = np.mean(vcarrSamples, axis=0)
-            vcarr_sig = np.sqrt(np.std(vcarrSamples, axis=0)**2 + constant_sig**2)
+            vcarr_mu = np.nanmean(results, axis=0)
+            vcarr_sig = np.sqrt(np.nanstd(results, axis=0)**2 + constant_sig**2)
         
             boundaryDistributions_dict[source] = {'t_grid': t,
                                                   'U_mu_grid': vcarr_mu,
