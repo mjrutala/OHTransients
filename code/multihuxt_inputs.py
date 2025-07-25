@@ -1019,8 +1019,14 @@ class multihuxt_inputs:
                     # Since we've ensured continuity, this *seems* to be okay
                     for i, sample in enumerate(samples.numpy().squeeze()):
                         sample_unscaled = var_rescaler.inverse_transform(sample[:, None])
-                        backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_unscaled.flatten()
+                        
+                        # Check if the Cholesky decomposition failed (all NaN?)
+                        if np.isnan(sample).any() == False:
+                            
+                            # If not, add the sample
+                            backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_unscaled.flatten()
                     
+         
         self.backgroundSamples = backgroundSamples
   
         return
@@ -1249,7 +1255,7 @@ class multihuxt_inputs:
             lon_1d = np.linspace(0, 360, nLon)
             mjd_1d = self.boundaryDistributions[source]['t_grid']
             lat_1d = np.interp(self.boundaryDistributions[source]['t_grid'],
-                               self.backgroundDistributions[source]['mjd'],
+                               self.backgroundDistributions['mjd'],
                                self.backgroundDistributions[source]['lat_HGI'])
             
             mjd_2d, lon_2d, = np.meshgrid(mjd_1d, lon_1d)
