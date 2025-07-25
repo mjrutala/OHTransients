@@ -608,10 +608,6 @@ class multihuxt_inputs:
                                          inducing_variable=True,
                                          simple=False):
         
-        # Assert the Synodic Carrington rotation period
-        # This will need to be made dynamic if not at 1 AU !!!!
-        # carrington_period = 27 * u.day
-        
         # Calculate the span from stop - start
         span = (self.stop - self.start).total_seconds() * u.s
         simspan = (self.simstop - self.simstart).total_seconds() * u.s
@@ -636,16 +632,20 @@ class multihuxt_inputs:
                 chunk_starts.pop()
                 chunk_stops.pop()
                 chunk_stops[-1] = self.simstop
+        n_chunks = len(chunk_starts)
         
         # More correct unit-slapping
         average_cluster_span *= u.hour
         
-        # # if simspan > break_at:
-        # n_chunks = np.ceil((span/break_at).decompose()).value
-            
-        # Hold the distributions in a dict until the end
-        backgroundDistributions_dict = {}
-        backgroundCovariances_dict = {}
+        target_variables = ['U'] # , 'BR']
+        
+        n_data = len(self.availableBackgroundData)
+        
+        ambient_solar_wind_d = {k: {v: {'mean': np.full([n_data, n_chunks], np.nan), 
+                                        'std': np.full([n_data, n_chunks], np.nan), 
+                                        'cov': np.full([n_data, n_data, n_chunks], np.nan)} 
+                                    for v in target_variables} 
+                                for k in self.boundarySources}
         
         for source in self.boundarySources:
             
@@ -667,15 +667,6 @@ class multihuxt_inputs:
             # Break the resulting df into chunks of size break_at, then loop
             insitu_noICME_chunks = []
             for chunk_start, chunk_stop in zip(chunk_starts, chunk_stops):
-            # for i in range(int(n_chunks)):
-                # chunk = insitu_noICME.iloc[int(i*break_at.value):int((i+1)*break_at.value)]
-                
-                # More sophisticated: ensure there's padding on either side of chunk
-                # chunk_starttime = self.starttime + i*break_at
-                # chunk_stoptime = self.starttime + (i+1)*break_at
-                
-                # chunk_simstarttime = chunk_starttime - self.simpadding[0]
-                # chunk_simstoptime = chunk_stoptime + self.simpadding[1]
                 
                 chunk = insitu_noICME.query("@chunk_start <= index < @chunk_stop")
                 
@@ -702,79 +693,62 @@ class multihuxt_inputs:
                     
                     carrington_period = self.get_carringtonPeriod(chunk_mean_dist)
                     
-                    new_insitu, covariance_dict = self.ambient_solar_wind_GP(chunk, 
-                                                                             average_cluster_span, 
-                                                                             carrington_period,
-                                                                             inducing_variable=inducing_variable)
+                    ambient_solar_wind = self.ambient_solar_wind_GP(chunk, 
+                                                                    average_cluster_span, 
+                                                                    carrington_period,
+                                                                    inducing_variable=inducing_variable,
+                                                                    target_variables=target_variables)
                     
-                    
-                    if new_insitu is None:
-                        breakpoint()
-                    
-                # # Retrieve the starttime and stoptime by un-padding
-                # if i == 0:
-                #     chunk_starttime_mjd = self.simstarttime.mjd
-                # else:
-                #     chunk_starttime_mjd = new_insitu['mjd'].iloc[0] + self.simpadding[0].to(u.day).value
-                # if i == (n_chunks-1):
-                #     chunk_stoptime_mjd = self.simstoptime.mjd
-                # else:
-                #     chunk_stoptime_mjd = new_insitu['mjd'].iloc[-1] - self.simpadding[1].to(u.day).value
+                c0indx = np.where(insitu_noICME['mjd'].to_numpy() == chunk['mjd'].to_numpy()[0])[0][0]
+                c1indx = c0indx + len(chunk)
+                for var in target_variables:
+                    ambient_solar_wind_d[source][var]['mean'][c0indx:c1indx, i] = ambient_solar_wind[var]['mean']
+                    ambient_solar_wind_d[source][var]['std'][c0indx:c1indx, i] = ambient_solar_wind[var]['std']
+                    ambient_solar_wind_d[source][var]['cov'][c0indx:c1indx, c0indx:c1indx, i] = ambient_solar_wind[var]['cov']
                 
-                # new_insitu.query("@chunk_starttime_mjd <= mjd <= @chunk_stoptime_mjd", inplace=True)
-                
-                # # def new_func(num_samples):
-                # #     return sample_func(new_insitu['mjd'].to_numpy(), num_samples)
-                
-                new_insitu_list.append(new_insitu)
-                covariance_list.append(covariance_dict)
-                
-                # sample_func_df.loc[i] = [chunk_starttime_mjd, chunk_stoptime_mjd, sample_func]
+        # Recombine the chunked mean, standard deviation and add them to a copy of the original data
+        backgroundDistributions = self.availableBackgroundData.copy(deep=True)
+        for source in set(self.availableSources) - set(self.boundarySources):
+            backgroundDistributions.drop(columns=[source], inplace=True)
             
-            # Concatenate chunks back together and add to dict
-            new_insitu_overlapping = pd.concat(new_insitu_list)
-            new_insitu_combined = new_insitu_overlapping.groupby(new_insitu_overlapping.index).mean()
-            backgroundDistributions_dict[source] = new_insitu_combined
-            
-            # =================================================================
-            # Combine the covariances into one large matrix
-            # =================================================================
-            # Initialize an empty covarince matrix
-            cov_empty = np.zeros((1, len(new_insitu_combined), len(new_insitu_combined)))
-            
-            # cov_empty = tf.zeros((1, len(new_insitu_combined), len(new_insitu_combined)), dtype='float64')
-            
-            covariance_combined = {}
-            for chunk_start, chunk_stop, cov_d in zip(chunk_starts, chunk_stops, covariance_list):
+        for source in self.boundarySources:
+            for var in target_variables:
+                backgroundDistributions.drop(columns=[(source, var)], inplace=True)
                 
-                # These give the indices into which the covariance matrix will be inserted
-                j0 = k0 = np.where(new_insitu_combined.index == chunk_start)[0][0]
-                if chunk_stop != chunk_stops[-1]:
-                    j1 = k1 = np.where(new_insitu_combined.index == chunk_stop)[0][0]
-                else:
-                    j1 = k1 = len(new_insitu_combined)
+                # This handles the overlapping portions of each chunk
+                mean_mean = np.nanmean(ambient_solar_wind_d[source][var]['mean'], axis=1)
+                mean_std = np.nanmean(ambient_solar_wind_d[source][var]['std'], axis=1)
                 
-                for key, cov in cov_d.items():
-                    
-                    if key not in covariance_combined.keys():
-                        covariance_combined[key] = copy.deepcopy(cov_empty)
-                        covariance_combined['n'+key] = copy.deepcopy(cov_empty)
-                        
-                    covariance_combined[key][:, j0:j1, k0:k1] += cov
-                    covariance_combined['n'+key][:, j0:j1, k0:k1] += 1
-                    
-            for key in covariance_list[0].keys():
-                cov = covariance_combined[key] / covariance_combined['n'+key]
-                covariance_combined[key] = tf.convert_to_tensor(cov) # Should be float64
-                covariance_combined.pop('n'+key)
-                
-            backgroundCovariances_dict[source] = covariance_combined
+                backgroundDistributions[(source, var+'_mu')] = mean_mean
+                backgroundDistributions[(source, var+'_sig')] = mean_std
         
-        backgroundDistributions = pd.concat(backgroundDistributions_dict,
-                                            axis='columns')
+        # Recombine the chunked covariance matrix, then store it with means as lists
+        # This is for easier sampling later
+        backgroundCovariances = {s: {v: {'time': [], 'mean': [], 'cov': []} 
+                                     for v in target_variables} 
+                                 for s in self.boundarySources}
+        
+        for source in self.boundarySources:
+            for var in target_variables:
+                
+                # This handles the overlapping portions of each chunk
+                mean_mean = np.nanmean(ambient_solar_wind_d[source][var]['mean'], axis=1)
+                mean_cov = np.nanmean(ambient_solar_wind_d[source][var]['cov'], axis=2)
+                
+                # Now that there aren't edge effects, split it back up
+                for chunk_start, chunk_stop in zip(chunk_starts, chunk_stops):
+                    c0indx = np.where(backgroundDistributions.index == chunk_start)[0][0]
+                    if chunk_stop != chunk_stops[-1]:
+                        c1indx = np.where(backgroundDistributions.index == chunk_stop)[0][0]
+                    else:
+                        c1indx = len(backgroundDistributions)
+                        
+                    backgroundCovariances[source][var]['time'].append(backgroundDistributions.index[c0indx:c1indx])
+                    backgroundCovariances[source][var]['mean'].append(mean_mean[c0indx:c1indx])
+                    backgroundCovariances[source][var]['cov'].append(mean_cov[c0indx:c1indx, c0indx:c1indx])
+        
         self.backgroundDistributions = backgroundDistributions
-        self.backgroundDistributions['mjd'] = self.availableBackgroundData['mjd']
-        self.backgroundCovariances = backgroundCovariances_dict
+        self.backgroundCovariances = backgroundCovariances
         
         # =============================================================================
         # Visualization
@@ -859,25 +833,20 @@ class multihuxt_inputs:
         from sklearn.cluster import KMeans
         
         # Check that all target_variables are present
-        if df['U'].isna().all() == True:
-            return None, None
-        
-        # new_insitu = df.copy(deep=True)
-        # new_insitu.drop(columns='U', inplace=True)
-        
-        # covariance_dict = {}
+        for target_variable in target_variables:
+            if df[target_variable].isna().all() == True:
+                print("All variables are NaNs; cannot proceed with GPR")
+                return None, None
         
         # Set up dictionaries 
+        gp_variables = {k: {} for k in target_variables}
         
-        for var_str in ['U']: # ['U', 'BR']:
+        for target_variable in target_variables:
                 
             # Get the mjd and U as column vectors for GPR
             df_nonan = df.dropna(axis='index', how='any', subset=['U'])
             mjd = df_nonan['mjd'].to_numpy(float)[:, None]
-            var = df_nonan[var_str].to_numpy(float)[:, None]
-            # insitu_short = insitu_noICME.dropna(axis='index', how='any', subset=['U'])
-            # mjd = insitu_short['mjd'].to_numpy(float)[:, None]
-            # U = insitu_short['U'].to_numpy(float)[:, None]
+            var = df_nonan[target_variable].to_numpy(float)[:, None]
     
             # MJD scaled to 1-day increments
             mjd_rescaler = MinMaxScaler((0, mjd[-1]-mjd[0]))
@@ -900,12 +869,15 @@ class multihuxt_inputs:
                 XYc = kmeans.cluster_centers_
                 # # This requires each cluster to have multiple points, which is not guaranteed
                 # # Instead, use the length scale as a guess at uncertaintys
-                # Yc_var = np.array([np.var(XY[kmeans.labels_ == i, 1]) 
-                #                    for i in range(kmeans.n_clusters)])
+                Yc_var = np.array([np.var(XY[kmeans.labels_ == i, 1]) 
+                                   for i in range(kmeans.n_clusters)])
+                approx_noise = np.percentile(Yc_var, 90)
             else:
                 n_clusters = len(XY)
                 XYc = XY
-            # Yc_var = np.array([0.01/var_rescaler.scale_]*len(XY))   
+                # 1/10 the overall standard deviation of Y
+                # Yc_var = np.array([0.1]*len(XY))
+                approx_noise = 0.1
             print("{} clusters to be fit".format(len(XYc)))
 
             
@@ -914,7 +886,7 @@ class multihuxt_inputs:
             cluster_sort = np.argsort(Xc)
             Xc = Xc[cluster_sort][:, None]
             Yc = Yc[cluster_sort][:, None]
-            # Yc_var = Yc_var[cluster_sort][:, None]
+            Yc_var = Yc_var[cluster_sort][:, None]
     
             # Construct the signal kernel for GP
             # Again, these lengthscales could probable be calculated?
@@ -929,7 +901,6 @@ class multihuxt_inputs:
             # signal_kernel = small_scale_kernel + large_scale_kernel + irregularities_kernel + carrington_kernel
             
             # New kernel
-            # period_rescaled = 100 / (simspan / carrington_period).decompose().value
             period_rescaled = carrington_period.to(u.day).value
             signal_kernel = gpflow.kernels.RationalQuadratic() + \
                             gpflow.kernels.RationalQuadratic() * \
@@ -941,12 +912,12 @@ class multihuxt_inputs:
             if inducing_variable == False:
                 model = gpflow.models.GPR((Xc, Yc), 
                                           kernel=copy.deepcopy(signal_kernel), 
-                                          # noise_variance=np.percentile(Yc_var, 90)
+                                          noise_variance=approx_noise
                                           )
             else:
                 model = gpflow.models.SGPR((X, Y), 
                                            kernel=copy.deepcopy(signal_kernel), 
-                                           # noise_variance=np.percentile(Yc_var, 90),
+                                           noise_variance=approx_noise,
                                            inducing_variable=Xc)
                 
             opt = gpflow.optimizers.Scipy()
@@ -966,35 +937,12 @@ class multihuxt_inputs:
             new_var_sig= Yo_sig * var_rescaler.scale_
             new_var_cov = cov * var_rescaler.scale_
             
-            new_insitu[var_str+'_mu'] = new_var_mu.ravel()
-            new_insitu[var_str+'_sig'] = new_var_sig.ravel()
+            # Assign to dict
+            gp_variables[target_variable]['mean'] = new_var_mu.ravel()
+            gp_variables[target_variable]['std'] = new_var_sig.ravel()
+            gp_variables[target_variable]['cov'] = new_var_cov.numpy().squeeze()
             
-            breakpoint()
-            covariance_dict[var_str+'_cov'] = new_var_cov
-            
-            # Replace non-ICME regions with real data
-            # noNaN_bool = ~df[var_str].isna()
-            # new_insitu.loc[noNaN_bool, 'U_mu'] = df.loc[noNaN_bool, 'U']
-            # new_insitu.loc[noNaN_bool, 'U_sig'] *= 1/10.
-            
-            # # Save a function to generate samples of f with full covariance
-            # def func(mjd, num_samples):
-            #     X = mjd_rescaler.transform(mjd[:,None])
-            #     foc = model.predict_f_samples(X, num_samples, full_cov=True)
-            #     fo_samples = np.array([var_rescaler.inverse_transform(f).ravel() for f in foc])
-            #     return fo_samples
-            
-            # Try my hand at sampling the covariance matrix directly
-            # import tensorflow as tf
-            # _, cov = model.predict_f(Xo, full_cov=True)
-            # mean_for_sample = tf.linalg.adjoint(mean)
-            
-            # samples = gpflow.conditionals.util.sample_mvn(
-            #     mean_for_sample, cov, True, num_samples=5)
-            
-            # samples = tf.linalg.adjoint(samples)
-            
-        return new_insitu, covariance_dict
+        return gp_variables
     
     def ambient_solar_wind_LI(self, df):
         
@@ -1036,53 +984,44 @@ class multihuxt_inputs:
             print("generate_backgroundDistributions() must be run before background samples can be generated")
         
         # Check if we've already generated some samples?
+        # breakpoint()
         
+        # Set up a list of sample dataframes ahead of time
+        backgroundSamples = [self.backgroundDistributions.copy(deep=True) for _ in range(num_samples)]            
         
         # Try my hand at sampling the covariance matrix directly
         for source in self.boundarySources:
-            
-            # Get the mean and columnize it
-            mu = self.backgroundDistributions[(source, 'U_mu')]
-            mu = mu.to_numpy()[:, None]
-            
-            var_rescaler = StandardScaler()
-            var_rescaler.fit(mu)
-            
-            # Format for tensorflow
-            mu_for_sample = tf.linalg.adjoint(var_rescaler.transform(mu))
-            
-            cov = self.backgroundCovariances[source]['U_cov'] 
-            cov_for_sample = cov/var_rescaler.scale_
-            # cov_for_sample = np.nan_to_num(cov/var_rescaler.scale_, nan=-1e-3) 
-        
-            samples = gpflow.conditionals.util.sample_mvn(
-                mu_for_sample, cov_for_sample, True, num_samples=num_samples)
-            
-            breakpoint()
-        
-        samples = tf.linalg.adjoint(samples)
-        
-        # Create a list of num_samples dfs to populate
-        sample_list = [self.backgroundDistributions.copy(deep=True) for _ in range(num_samples)]
-        
-        #
-        for source in self.boundarySources:
-            for i, row in tqdm.tqdm(self.backgroundSamplers[source].iterrows(), desc="Sampling for {}".format(source), total=num_samples):
+            for var, vals in self.backgroundCovariances[source].items():
                 
-                # Get MJD array to feed into function
-                sample = self.backgroundDistributions.query("@row['start_mjd'] <= `('mjd', '')` < @row['stop_mjd']")
-                sample_mjd = sample['mjd']
+                time_list = vals['time']
+                mu_list = vals['mean']
+                cov_list = vals['cov']
                 
-                result_list = row['func'](sample_mjd.to_numpy(float), num_samples)
-                for j, result in enumerate(result_list):
+                for time, mu, cov in zip(time_list, mu_list, cov_list):
+                
+                    # Get a rescaler to satisfy the matrix sampler
+                    var_rescaler = StandardScaler()
+                    var_rescaler.fit(mu[:, None])
                     
-                    # Add to list of dfs
-                    sample_list[j].loc[sample.index, (source, 'U_mu')] = result
+                    # Columnize the mean
+                    mu_scaled = var_rescaler.transform(mu[:, None])
+                    mu_for_sample = tf.linalg.adjoint(mu_scaled)
                     
-                    # Keep the uncertainties the same
-                    # result_list[i].loc[sample.index, (source, 'U_sig')] = 
+                    # "Columnize" the covariance matrix
+                    cov_scaled = cov / var_rescaler.scale_
+                    cov_for_sample = cov_scaled[None, :, :]
                     
-        self.backgroundSamples = sample_list
+                    # Get samples
+                    samples = gpflow.conditionals.util.sample_mvn(
+                        mu_for_sample, cov_for_sample, True, num_samples=num_samples)
+                    
+                    # Each successive chunk will overwrite the previous overlapping bit
+                    # Since we've ensured continuity, this *seems* to be okay
+                    for i, sample in enumerate(samples.numpy().squeeze()):
+                        sample_unscaled = var_rescaler.inverse_transform(sample[:, None])
+                        backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_unscaled.flatten()
+                    
+        self.backgroundSamples = backgroundSamples
   
         return
         
