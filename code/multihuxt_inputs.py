@@ -26,6 +26,7 @@ from astroquery.jplhorizons import Horizons
 import pickle
 import tqdm
 import copy
+import tensorflow as tf
 
 import sys
 sys.path.append('/Users/mrutala/projects/HUXt/code/')
@@ -126,7 +127,10 @@ class multihuxt_inputs:
         self.SynodicCarringtonRotation = 25.38 * u.day
         
         # Required initializations
+        # Other methods check that these are None (or have value) before 
+        # continuing, so they must be intialized here
         self._boundarySources = None
+        self._ephemeris = {}
         
         # Input data initialization
         cols = ['t_mu', 't_sig', 'lon_mu', 'lon_sig', 'lat_mu', 'lat_sig',
@@ -572,32 +576,77 @@ class multihuxt_inputs:
             
         return insitu_noicme['U'].isna()
     
+    @property
+    def ephemeris(self):
+        from astropy.time import Time
+        # If this hasn't been run before, run for all 
+        if len(self._ephemeris) == 0:
+            print("No ephemeris loaded. Now generating...")
+            for source in self.availableSources:
+                eph = H.Observer(source, Time(self.availableBackgroundData.index))
+                self._ephemeris[source] = eph
+                    
+        return self._ephemeris
+    
+    
+    def get_carringtonPeriod(self, distance):
+                   
+        # source speed, approximated as circular
+        kepler_const = ((1 * u.year).to(u.day))/((1 * u.au)**(3/2))
+        source_period = kepler_const * distance**(3/2)
+        source_speed = (2 * np.pi * u.rad) / (source_period.to(u.day))
+        
+        # sun speed
+        sun_speed = (2 * np.pi * u.rad)/(25.38 * u.day)
+        
+        synodic_period = 1/(sun_speed - source_speed) * (2 * np.pi * u.rad)
+        
+        return synodic_period
+
     def generate_backgroundDistributions(self, insitu=None, ICME_df=None, 
-                                         break_at=None, average_cluster_span=6,
+                                         chunking=(60,30), average_cluster_span=6,
                                          inducing_variable=True,
                                          simple=False):
         
         # Assert the Synodic Carrington rotation period
         # This will need to be made dynamic if not at 1 AU !!!!
-        carrington_period = 27 * u.day
+        # carrington_period = 27 * u.day
         
         # Calculate the span from stop - start
         span = (self.stop - self.start).total_seconds() * u.s
         simspan = (self.simstop - self.simstart).total_seconds() * u.s
         
         # Parse optional keywords
-        if break_at is None:
-            break_at = simspan + 1*u.hour
+        chunk_starts, chunk_stops = [], []
+        if chunking is None:
+            chunk_starts.append(self.simstart)
+            chunk_stops.append(self.simstop)
         else:
-            break_at *= u.hour   
+            # Slap some correct units on
+            chunking *= u.day
+            
+            n_chunks_approx = np.ceil((simspan/chunking[1]).decompose()).value - 1
+            
+            for i in range(int(n_chunks_approx)):
+                chunk_starts.append(self.simstart + datetime.timedelta(days=chunking[1].value*i))
+                chunk_stops.append(chunk_starts[-1] + datetime.timedelta(days=chunking[0].value))
+            chunk_stops[-1] = self.simstop
+            # Merge the last two chunks if the last chunk is too small
+            if (chunk_stops[-1] - chunk_starts[-1]).total_seconds() * u.s < 0.5 * chunking[1]:
+                chunk_starts.pop()
+                chunk_stops.pop()
+                chunk_stops[-1] = self.simstop
+        
+        # More correct unit-slapping
         average_cluster_span *= u.hour
         
-        # if simspan > break_at:
-        n_chunks = np.ceil((span/break_at).decompose()).value
+        # # if simspan > break_at:
+        # n_chunks = np.ceil((span/break_at).decompose()).value
             
         # Hold the distributions in a dict until the end
         backgroundDistributions_dict = {}
-        backgroundSamplers_dict = {}
+        backgroundCovariances_dict = {}
+        
         for source in self.boundarySources:
             
             # If indexICME is not supplied, look it up
@@ -612,21 +661,23 @@ class multihuxt_inputs:
             insitu_noICME.loc[indexICME, ['U', 'BR']] = np.nan
             
             new_insitu_list = []
-            sample_func_df = pd.DataFrame(columns=['start_mjd', 'stop_mjd', 'func'])
+            covariance_list = []
+            # sample_func_df = pd.DataFrame(columns=['start_mjd', 'stop_mjd', 'func'])
             
             # Break the resulting df into chunks of size break_at, then loop
             insitu_noICME_chunks = []
-            for i in range(int(n_chunks)):
+            for chunk_start, chunk_stop in zip(chunk_starts, chunk_stops):
+            # for i in range(int(n_chunks)):
                 # chunk = insitu_noICME.iloc[int(i*break_at.value):int((i+1)*break_at.value)]
                 
                 # More sophisticated: ensure there's padding on either side of chunk
-                chunk_starttime = self.starttime + i*break_at
-                chunk_stoptime = self.starttime + (i+1)*break_at
+                # chunk_starttime = self.starttime + i*break_at
+                # chunk_stoptime = self.starttime + (i+1)*break_at
                 
-                chunk_simstarttime = chunk_starttime - self.simpadding[0]
-                chunk_simstoptime = chunk_stoptime + self.simpadding[1]
+                # chunk_simstarttime = chunk_starttime - self.simpadding[0]
+                # chunk_simstoptime = chunk_stoptime + self.simpadding[1]
                 
-                chunk = insitu_noICME.query("@chunk_simstarttime.mjd <= mjd < @chunk_simstoptime.mjd")
+                chunk = insitu_noICME.query("@chunk_start <= index < @chunk_stop")
                 
                 insitu_noICME_chunks.append(chunk)
             
@@ -641,42 +692,89 @@ class multihuxt_inputs:
                 else:
                     # Perform the GPR
                     if chunk['U'].isna().all():
+                        print("ERROR: No valid variable for GPR (all NaN!)")
                         breakpoint()
-                    new_insitu, sample_func = self.ambient_solar_wind_GP(chunk, 
-                                                                         average_cluster_span, 
-                                                                         carrington_period,
-                                                                         inducing_variable=inducing_variable)
+                        
+                    # Calculate Carrington Period for this source
+                    chunk_eph_indx = (self.ephemeris[source].time.mjd >= chunk['mjd'].iloc[0]) & \
+                                     (self.ephemeris[source].time.mjd < chunk['mjd'].iloc[-1])
+                    chunk_mean_dist = self.ephemeris[source].r[chunk_eph_indx].mean()
+                    
+                    carrington_period = self.get_carringtonPeriod(chunk_mean_dist)
+                    
+                    new_insitu, covariance_dict = self.ambient_solar_wind_GP(chunk, 
+                                                                             average_cluster_span, 
+                                                                             carrington_period,
+                                                                             inducing_variable=inducing_variable)
+                    
+                    
                     if new_insitu is None:
                         breakpoint()
                     
-                # Retrieve the starttime and stoptime by un-padding
-                if i == 0:
-                    chunk_starttime_mjd = self.simstarttime.mjd
-                else:
-                    chunk_starttime_mjd = new_insitu['mjd'].iloc[0] + self.simpadding[0].to(u.day).value
-                if i == (n_chunks-1):
-                    chunk_stoptime_mjd = self.simstoptime.mjd
-                else:
-                    chunk_stoptime_mjd = new_insitu['mjd'].iloc[-1] - self.simpadding[1].to(u.day).value
+                # # Retrieve the starttime and stoptime by un-padding
+                # if i == 0:
+                #     chunk_starttime_mjd = self.simstarttime.mjd
+                # else:
+                #     chunk_starttime_mjd = new_insitu['mjd'].iloc[0] + self.simpadding[0].to(u.day).value
+                # if i == (n_chunks-1):
+                #     chunk_stoptime_mjd = self.simstoptime.mjd
+                # else:
+                #     chunk_stoptime_mjd = new_insitu['mjd'].iloc[-1] - self.simpadding[1].to(u.day).value
                 
-                new_insitu.query("@chunk_starttime_mjd <= mjd <= @chunk_stoptime_mjd", inplace=True)
+                # new_insitu.query("@chunk_starttime_mjd <= mjd <= @chunk_stoptime_mjd", inplace=True)
                 
-                # def new_func(num_samples):
-                #     return sample_func(new_insitu['mjd'].to_numpy(), num_samples)
+                # # def new_func(num_samples):
+                # #     return sample_func(new_insitu['mjd'].to_numpy(), num_samples)
                 
                 new_insitu_list.append(new_insitu)
-                sample_func_df.loc[i] = [chunk_starttime_mjd, chunk_stoptime_mjd, sample_func]
+                covariance_list.append(covariance_dict)
+                
+                # sample_func_df.loc[i] = [chunk_starttime_mjd, chunk_stoptime_mjd, sample_func]
             
             # Concatenate chunks back together and add to dict
-            new_insitu_combined = pd.concat(new_insitu_list)
+            new_insitu_overlapping = pd.concat(new_insitu_list)
+            new_insitu_combined = new_insitu_overlapping.groupby(new_insitu_overlapping.index).mean()
             backgroundDistributions_dict[source] = new_insitu_combined
-            backgroundSamplers_dict[source] = sample_func_df
+            
+            # =================================================================
+            # Combine the covariances into one large matrix
+            # =================================================================
+            # Initialize an empty covarince matrix
+            cov_empty = np.zeros((1, len(new_insitu_combined), len(new_insitu_combined)))
+            
+            # cov_empty = tf.zeros((1, len(new_insitu_combined), len(new_insitu_combined)), dtype='float64')
+            
+            covariance_combined = {}
+            for chunk_start, chunk_stop, cov_d in zip(chunk_starts, chunk_stops, covariance_list):
+                
+                # These give the indices into which the covariance matrix will be inserted
+                j0 = k0 = np.where(new_insitu_combined.index == chunk_start)[0][0]
+                if chunk_stop != chunk_stops[-1]:
+                    j1 = k1 = np.where(new_insitu_combined.index == chunk_stop)[0][0]
+                else:
+                    j1 = k1 = len(new_insitu_combined)
+                
+                for key, cov in cov_d.items():
+                    
+                    if key not in covariance_combined.keys():
+                        covariance_combined[key] = copy.deepcopy(cov_empty)
+                        covariance_combined['n'+key] = copy.deepcopy(cov_empty)
+                        
+                    covariance_combined[key][:, j0:j1, k0:k1] += cov
+                    covariance_combined['n'+key][:, j0:j1, k0:k1] += 1
+                    
+            for key in covariance_list[0].keys():
+                cov = covariance_combined[key] / covariance_combined['n'+key]
+                covariance_combined[key] = tf.convert_to_tensor(cov) # Should be float64
+                covariance_combined.pop('n'+key)
+                
+            backgroundCovariances_dict[source] = covariance_combined
         
         backgroundDistributions = pd.concat(backgroundDistributions_dict,
                                             axis='columns')
         self.backgroundDistributions = backgroundDistributions
         self.backgroundDistributions['mjd'] = self.availableBackgroundData['mjd']
-        self.backgroundSamplers = pd.concat(backgroundSamplers_dict, axis=1)
+        self.backgroundCovariances = backgroundCovariances_dict
         
         # =============================================================================
         # Visualization
@@ -685,7 +783,8 @@ class multihuxt_inputs:
                                 figsize=(6, 4.5))
         plt.subplots_adjust(bottom=(0.16), left=(0.12), top=(1-0.08), right=(1-0.06),
                             hspace=0)
-        
+        if len(self.boundarySources) == 1:
+            axs = [axs]
         for ax, source in zip(axs, self.boundarySources):
             
             ax.scatter(self.availableBackgroundData['mjd'], self.availableBackgroundData[(source, 'U')],
@@ -754,16 +853,21 @@ class multihuxt_inputs:
         return
     
     def ambient_solar_wind_GP(self, df, average_cluster_span, carrington_period,
-                              inducing_variable=False):
+                              inducing_variable=False, target_variables=['U']):
         from sklearn.preprocessing import StandardScaler, MinMaxScaler
         import gpflow
         from sklearn.cluster import KMeans
         
+        # Check that all target_variables are present
         if df['U'].isna().all() == True:
             return None, None
         
-        new_insitu = df.copy(deep=True)
-        new_insitu.drop(columns='U', inplace=True)
+        # new_insitu = df.copy(deep=True)
+        # new_insitu.drop(columns='U', inplace=True)
+        
+        # covariance_dict = {}
+        
+        # Set up dictionaries 
         
         for var_str in ['U']: # ['U', 'BR']:
                 
@@ -855,28 +959,42 @@ class multihuxt_inputs:
             Yo_mu, Yo_var = model.predict_y(Xo)
             Yo_mu, Yoc_var = np.array(Yo_mu), np.array(Yo_var)
             Yo_sig = np.sqrt(Yo_var)
+            _, cov = model.predict_f(Xo, full_cov=True)
             
             new_mjd = mjd_rescaler.inverse_transform(Xo)
             new_var_mu = var_rescaler.inverse_transform(Yo_mu)
             new_var_sig= Yo_sig * var_rescaler.scale_
+            new_var_cov = cov * var_rescaler.scale_
             
-        
             new_insitu[var_str+'_mu'] = new_var_mu.ravel()
             new_insitu[var_str+'_sig'] = new_var_sig.ravel()
+            
+            breakpoint()
+            covariance_dict[var_str+'_cov'] = new_var_cov
             
             # Replace non-ICME regions with real data
             # noNaN_bool = ~df[var_str].isna()
             # new_insitu.loc[noNaN_bool, 'U_mu'] = df.loc[noNaN_bool, 'U']
             # new_insitu.loc[noNaN_bool, 'U_sig'] *= 1/10.
             
-            # Save a function to generate samples of f with full covariance
-            def func(mjd, num_samples):
-                X = mjd_rescaler.transform(mjd[:,None])
-                foc = model.predict_f_samples(X, num_samples, full_cov=True)
-                fo_samples = np.array([var_rescaler.inverse_transform(f).ravel() for f in foc])
-                return fo_samples
-        
-        return new_insitu, func
+            # # Save a function to generate samples of f with full covariance
+            # def func(mjd, num_samples):
+            #     X = mjd_rescaler.transform(mjd[:,None])
+            #     foc = model.predict_f_samples(X, num_samples, full_cov=True)
+            #     fo_samples = np.array([var_rescaler.inverse_transform(f).ravel() for f in foc])
+            #     return fo_samples
+            
+            # Try my hand at sampling the covariance matrix directly
+            # import tensorflow as tf
+            # _, cov = model.predict_f(Xo, full_cov=True)
+            # mean_for_sample = tf.linalg.adjoint(mean)
+            
+            # samples = gpflow.conditionals.util.sample_mvn(
+            #     mean_for_sample, cov, True, num_samples=5)
+            
+            # samples = tf.linalg.adjoint(samples)
+            
+        return new_insitu, covariance_dict
     
     def ambient_solar_wind_LI(self, df):
         
@@ -902,19 +1020,47 @@ class multihuxt_inputs:
                     fo_samples.append(sample)
                 fo_samples = np.array(fo_samples)
                 return fo_samples
-        
+            
+            breakpoint()
+            
         return new_insitu, func
                  
     def generate_backgroundSamples(self, num_samples):
+        import gpflow
+        from sklearn.preprocessing import StandardScaler, MinMaxScaler
         
         # Check that the sampler functions have been defined
         try: 
-            keys = self.backgroundSamplers.keys()
+            keys = self.backgroundCovariances.keys()
         except:
             print("generate_backgroundDistributions() must be run before background samples can be generated")
         
         # Check if we've already generated some samples?
         
+        
+        # Try my hand at sampling the covariance matrix directly
+        for source in self.boundarySources:
+            
+            # Get the mean and columnize it
+            mu = self.backgroundDistributions[(source, 'U_mu')]
+            mu = mu.to_numpy()[:, None]
+            
+            var_rescaler = StandardScaler()
+            var_rescaler.fit(mu)
+            
+            # Format for tensorflow
+            mu_for_sample = tf.linalg.adjoint(var_rescaler.transform(mu))
+            
+            cov = self.backgroundCovariances[source]['U_cov'] 
+            cov_for_sample = cov/var_rescaler.scale_
+            # cov_for_sample = np.nan_to_num(cov/var_rescaler.scale_, nan=-1e-3) 
+        
+            samples = gpflow.conditionals.util.sample_mvn(
+                mu_for_sample, cov_for_sample, True, num_samples=num_samples)
+            
+            breakpoint()
+        
+        samples = tf.linalg.adjoint(samples)
         
         # Create a list of num_samples dfs to populate
         sample_list = [self.backgroundDistributions.copy(deep=True) for _ in range(num_samples)]
@@ -940,7 +1086,7 @@ class multihuxt_inputs:
   
         return
         
-    def generate_boundaryDistributions(self, nSamples=16, constant_sig=0):
+    def generate_boundaryDistributions(self, constant_sig=0):
         from tqdm import tqdm
         # from dask.distributed import Client, as_completed, LocalCluster
         import multiprocessing as mp
@@ -952,8 +1098,8 @@ class multihuxt_inputs:
 
         rng = np.random.default_rng()
         
-        methodOptions = ['forward', 'back', 'both']
-        # methodOptions = ['both']
+        # methodOptions = ['forward', 'back', 'both']
+        methodOptions = ['both']
         
         # # Define an inner function to be run in parallel
         # def map_vBoundaryInwards(source, insitu_df, corot_type):
@@ -1101,6 +1247,12 @@ class multihuxt_inputs:
                           (nLat, 1, 1))
         
         return U_mu_3d, U_sigma_3d, B_3d
+    
+    def _interpolate_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d):
+        
+        breakpoint()
+        
+        return
         
     def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d):
         import gpflow
@@ -1227,7 +1379,7 @@ class multihuxt_inputs:
         
         print("Optimizing GP Model... This may take some time.")
         print("Trying to optimize for {} point".format(len(Yc_mu)))
-        print("Continue?")
+        # print("Continue?")
         # breakpoint()
         
         model_mu = gpflow.models.GPR((Xc, Yc_mu),
