@@ -724,7 +724,7 @@ class multihuxt_inputs:
         
         # Recombine the chunked covariance matrix, then store it with means as lists
         # This is for easier sampling later
-        backgroundCovariances = {s: {v: {'time': [], 'mean': [], 'cov': []} 
+        backgroundCovariances = {s: {v: {'time': [], 'mean': [], 'std': [], 'cov': []} 
                                      for v in target_variables} 
                                  for s in self.boundarySources}
         
@@ -733,6 +733,7 @@ class multihuxt_inputs:
                 
                 # This handles the overlapping portions of each chunk
                 mean_mean = np.nanmean(ambient_solar_wind_d[source][var]['mean'], axis=1)
+                mean_std = np.nanmean(ambient_solar_wind_d[source][var]['std'], axis=1)
                 mean_cov = np.nanmean(ambient_solar_wind_d[source][var]['cov'], axis=2)
                 
                 # Now that there aren't edge effects, split it back up
@@ -745,6 +746,7 @@ class multihuxt_inputs:
                         
                     backgroundCovariances[source][var]['time'].append(backgroundDistributions.index[c0indx:c1indx])
                     backgroundCovariances[source][var]['mean'].append(mean_mean[c0indx:c1indx])
+                    backgroundCovariances[source][var]['std'].append(mean_std[c0indx:c1indx])
                     backgroundCovariances[source][var]['cov'].append(mean_cov[c0indx:c1indx, c0indx:c1indx])
         
         self.backgroundDistributions = backgroundDistributions
@@ -995,10 +997,13 @@ class multihuxt_inputs:
                 
                 time_list = vals['time']
                 mu_list = vals['mean']
+                std_list = vals['std']
                 cov_list = vals['cov']
                 
-                for time, mu, cov in zip(time_list, mu_list, cov_list):
+                rng = np.random.default_rng()
                 
+                for time, mu, std, cov in zip(time_list, mu_list, std_list, cov_list):
+                    
                     # Get a rescaler to satisfy the matrix sampler
                     var_rescaler = StandardScaler()
                     var_rescaler.fit(mu[:, None])
@@ -1007,26 +1012,42 @@ class multihuxt_inputs:
                     mu_scaled = var_rescaler.transform(mu[:, None])
                     mu_for_sample = tf.linalg.adjoint(mu_scaled)
                     
+                    # Columnize the standard deviation
+                    sigma_scaled = std[:, None]/var_rescaler.scale_
+                    
+                    # Get randomly sampled mean + standard deviation (as backup)
+                    samples_rng = [rng.normal(loc = mu_scaled, scale = sigma_scaled) 
+                                   for _ in range(num_samples)]
+                    samples_rng = np.array(samples_rng).squeeze()
+                    
                     # "Columnize" the covariance matrix
                     cov_scaled = cov / var_rescaler.scale_
                     cov_for_sample = cov_scaled[None, :, :]
                     
                     # Get samples
-                    samples = gpflow.conditionals.util.sample_mvn(
+                    samples_cov = gpflow.conditionals.util.sample_mvn(
                         mu_for_sample, cov_for_sample, True, num_samples=num_samples)
+                    samples_cov = samples_cov.numpy().squeeze()
                     
                     # Each successive chunk will overwrite the previous overlapping bit
                     # Since we've ensured continuity, this *seems* to be okay
-                    for i, sample in enumerate(samples.numpy().squeeze()):
-                        sample_unscaled = var_rescaler.inverse_transform(sample[:, None])
+                    for i, (sample_cov, sample_rng) in enumerate(zip(samples_cov, samples_rng)):
+                        
+                        sample_cov_unscaled = var_rescaler.inverse_transform(sample_cov[:, None])
+                        sample_rng_unscaled = var_rescaler.inverse_transform(sample_rng[:, None])
                         
                         # Check if the Cholesky decomposition failed (all NaN?)
-                        if np.isnan(sample).any() == False:
+                        if np.isnan(sample_cov).any() == False:
                             
                             # If not, add the sample
-                            backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_unscaled.flatten()
+                            backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_cov_unscaled.flatten()
+                            backgroundSamples[i].loc[time, (source, var+'_sig')] = 0
+                            
+                        else: 
+                            
+                            backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_rng_unscaled.flatten()
+                            # Sigma remains unchanged for this case
                     
-         
         self.backgroundSamples = backgroundSamples
   
         return
@@ -1045,36 +1066,6 @@ class multihuxt_inputs:
         
         # methodOptions = ['forward', 'back', 'both']
         methodOptions = ['both']
-        
-        # # Define an inner function to be run in parallel
-        # def map_vBoundaryInwards(source, insitu_df, corot_type):
-            
-        #     # Generate the Carrington grids
-        #     t, vcarr, bcarr = Hin.generate_vCarr_from_insitu(self.simstart, self.simstop, 
-        #                                                      insitu_source=source, insitu_input=insitu_df, 
-        #                                                      corot_type=corot_type)
-
-            
-        #     # Map to 210 solar radii, then to the inner boundary for the model
-        #     vcarr_210 = vcarr.copy()
-        #     vcarr_21p5 = vcarr.copy()
-        #     for i, _ in enumerate(t):
-                
-        #         # vcarr_210[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s, 
-        #         #                                             (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad), 
-        #         #                                             210 * u.solRad)
-                
-        #         # vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr_210[:,i]*u.km/u.s,
-        #         #                                              210 * u.solRad,
-        #         #                                              self.innerbound)
-                
-        #         vcarr_21p5[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s,
-        #                                                      (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad),
-        #                                                      self.innerbound)
-                
-                
-        #     return vcarr_21p5
-        
         
         boundaryDistributions_dict = {}
         for source in self.boundarySources:
@@ -1120,7 +1111,8 @@ class multihuxt_inputs:
             # Characterize the resulting samples as one distribution
             vcarr_mu = np.nanmean(results, axis=0)
             vcarr_sig = np.sqrt(np.nanstd(results, axis=0)**2 + constant_sig**2)
-        
+            
+            
             boundaryDistributions_dict[source] = {'t_grid': t,
                                                   'U_mu_grid': vcarr_mu,
                                                   'U_sig_grid': vcarr_sig,
@@ -1291,64 +1283,77 @@ class multihuxt_inputs:
         yval_mu = val_scaler.transform(val_mu[~np.isnan(val_mu),None])
         yval_sigma = (1/val_scaler.scale_) * val_sigma[~np.isnan(val_sigma),None]
         
-        # xlon = xlon[~np.isnan(yval)]
-        # xlat = xlat[~np.isnan(yval)]
-        # yval = yval[~np.isnan(yval)][:,None]
+        # =============================================================================
+        #         # Find XY clusters to reduce number of points in GP
+        # =============================================================================
+        # print("OPTIMIZE DOWNSAMPLING BY Z-SCORE RMSE")
+        # breakpoint()
         
-        # Find XY clusters to reduce number of points in GP
-        n_clusters = int(0.01 * len(yval_mu))
+        # n_clusters = int(0.01 * len(yval_mu))
+        n_clusters = 2000
         
         X = np.column_stack([xlat, xlon, xmjd])
         Y_mu = yval_mu
         Y_sigma = yval_sigma
         
-        XY = np.column_stack([X, Y_mu, Y_sigma])
+        # Cluster for means
+        XY_mu = np.column_stack([X, Y_mu])
+        kmeans_mu = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
+        XYc_mu = kmeans_mu.cluster_centers_
+        Xc_mu, Yc_mu = XYc_mu[:,:3], XYc_mu[:,3][:,None]
+        Yc_mu_sigma = np.array([np.std(XY_mu[kmeans_mu.labels_ == i, 1]) 
+                                for i in range(kmeans_mu.n_clusters)])
+        Yc_mu_noise = np.percentile(Yc_mu_sigma, 50)**2
         
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY)
-        XYc = kmeans.cluster_centers_
-        # Xc, Yc = XYc[:,0:3], XYc[:,3][:,None]
-        Xc, Yc_mu, Yc_sigma = XYc[:,:3], XYc[:,3][:,None], XYc[:,4][:,None] # 2D Y
+        # Cluster for standard deviations
+        XY_sigma = np.column_stack([X, Y_sigma])
+        kmeans_sigma = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_sigma)
+        XYc_sigma = kmeans_sigma.cluster_centers_
+        Xc_sigma, Yc_sigma = XYc_sigma[:,:3], XYc_sigma[:,3][:,None]
+        Yc_sigma_sigma = np.array([np.std(XY_sigma[kmeans_sigma.labels_ == i, 1]) 
+                                for i in range(kmeans_sigma.n_clusters)])
+        Yc_sigma_noise = np.percentile(Yc_mu_sigma, 50)**2
+
+        # =============================================================================
+        #         # Define kernel for each dimension separately, then altogether
+        # =============================================================================
+        lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0])
         
-        # kernel = gpflow.kernels.RBF()
-        
-        lat_kernel = gpflow.kernels.RBF(active_dims=[0])
-        lon_kernel = gpflow.kernels.Periodic(gpflow.kernels.RBF(active_dims=[1]), 
+        lon_kernel = gpflow.kernels.SquaredExponential(active_dims=[1]) + \
+                     gpflow.kernels.SquaredExponential(active_dims=[1]) * \
+                     gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(active_dims=[1]), 
                                              period=gpflow.Parameter(1, trainable=False))
-        mjd_kernel = gpflow.kernels.RBF(active_dims=[2])
-        all_kernel = gpflow.kernels.RBF()
+                     
+        mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2])
+        
+        all_kernel = gpflow.kernels.RationalQuadratic()
         kernel_mu = (lat_kernel + lon_kernel + mjd_kernel + 
                      lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
                      all_kernel)
-        # import copy
+        
         kernel_sigma = copy.deepcopy(kernel_mu)
         
+        # =============================================================================
+        #         Optimize
+        # =============================================================================
         print("Optimizing GP Model... This may take some time.")
         print("Trying to optimize for {} point".format(len(Yc_mu)))
-        # print("Continue?")
-        # breakpoint()
         
-        model_mu = gpflow.models.GPR((Xc, Yc_mu),
+        model_mu = gpflow.models.GPR((Xc_mu, Yc_mu),
                                      kernel=kernel_mu,
-                                     noise_variance=1.0)
+                                     noise_variance=Yc_mu_noise)
         opt_mu = gpflow.optimizers.Scipy()
         opt_mu.minimize(model_mu.training_loss, model_mu.trainable_variables)
         
-        model_sigma = gpflow.models.GPR((Xc, Yc_sigma),
+        model_sigma = gpflow.models.GPR((Xc_sigma, Yc_sigma),
                                         kernel=kernel_sigma,
-                                        noise_variance=1.0)
+                                        noise_variance=Yc_sigma_noise)
         opt_sigma = gpflow.optimizers.Scipy()
         opt_sigma.minimize(model_sigma.training_loss, model_sigma.trainable_variables)
         
-        # model = gpflow.models.GPR((Xc, Yc),
-        #                           kernel=kernel,
-        #                           likelihood=gpflow.likelihoods.Gaussian(scale=gpflow.functions.Polynomial(degree=2)),
-        #                           )
-        
-        # model = gpflow.models.GPR((Xc, Yc),
-        #                           kernel=kernel)
-        
-        
-        
+        # =============================================================================
+        # Predict values for the full grid...     
+        # =============================================================================
         Xlat, Xlon, Xmjd = np.meshgrid(lat_scaler.transform(lat_for3d[:,None]),
                                        lon_scaler.transform(lon_for3d[:,None]), 
                                        mjd_scaler.transform(mjd_for3d[:,None]),
@@ -1357,20 +1362,7 @@ class multihuxt_inputs:
                                Xlon.flatten()[:,None],
                                Xmjd.flatten()[:,None]])
         
-        # def chunk(iterable, size):
-        #     return [iterable[pos:pos + size] for pos in range(0, len(iterable), size)]
-        # X3d_chunks = chunk(X3d, chunksize)
-        # for X3d_chunk in X3d_chunks:
-        #     Ymu, Ysigma2 = model.predict_y(X3d)
-        
-        # Ymu, Ysigma = np.zeros((len(X3d),1)), np.zeros((len(X3d),1))
-        # for pos in tqdm.tqdm(range(0, len(X3d), chunksize)):
-            
-        #     X3d_chunk = X3d[pos:pos + chunksize]
-            
-        #     Ymu_chunk, Ysigma2_chunk = model.predict_y(X3d_chunk)
-        #     Ymu[pos:pos + chunksize] = Ymu_chunk
-        #     Ysigma[pos:pos + chunksize] = tf.sqrt(Ysigma2_chunk)
+        breakpoint()
         
         # Parallel chunk processing 
         nCores = int(0.75 * mp.cpu_count()) 
