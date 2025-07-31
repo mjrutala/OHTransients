@@ -677,7 +677,7 @@ class multihuxt_inputs:
                 # Option #1: Simple linear interpolation
                 if simple:
                     print("Skipping GPR!")
-                    new_insitu, sample_func = self.ambient_solar_wind_LI(chunk)
+                    ambient_solar_wind = self.ambient_solar_wind_LI(chunk)
                 
                 # Options #2: Gaussian Process Regression
                 else:
@@ -946,34 +946,47 @@ class multihuxt_inputs:
             
         return gp_variables
     
-    def ambient_solar_wind_LI(self, df):
+    def ambient_solar_wind_LI(self, df, target_variables=['U']):
         
         
         new_insitu = df.copy(deep=True)
         new_insitu.drop(columns='U', inplace=True)
         
-        for var_str in ['U']: # ['U', 'BR']:
+        # Set up dictionaries 
+        gp_variables = {k: {} for k in target_variables}
+        
+        for target_var in target_variables: # ['U', 'BR']:
             
-            new_insitu['U_mu'] = df[var_str].interpolate(limit_direction=None)
-            new_insitu['U_sig'] = new_insitu['U_mu'].rolling('1d').std()
+            new_insitu[target_var+'_mu'] = df[target_var].interpolate(limit_direction=None)
+            new_insitu[target_var+'_sig'] = new_insitu[target_var+'_mu'].rolling('1d').std()
+            
+            new_var_mu = df[target_var].interpolate(limit_direction=None)
+            new_var_sig = new_var_mu.rolling('1d').std()
+            new_var_cov = np.full((len(new_var_mu), len(new_var_mu)), np.nan)
+            
+            new_var_mu = new_var_mu.to_numpy()
+            new_var_sig = new_var_sig.to_numpy()
 
             # # Replace non-ICME regions with real data
             # noNaN_bool = ~df[var_str].isna()
             # new_insitu.loc[noNaN_bool, 'U_mu'] = df.loc[noNaN_bool, 'U']
             # new_insitu.loc[noNaN_bool, 'U_sig'] *= 1/10.
             
-            # # Save a function to generate samples of f with full covariance
-            def func(mjd, num_samples):
-                fo_samples = []
-                for _ in range(num_samples):
-                    sample = new_insitu.query("@mjd[0] <= mjd <= @mjd[-1]")[var_str+'_mu']
-                    fo_samples.append(sample)
-                fo_samples = np.array(fo_samples)
-                return fo_samples
+            # # # Save a function to generate samples of f with full covariance
+            # def func(mjd, num_samples):
+            #     fo_samples = []
+            #     for _ in range(num_samples):
+            #         sample = new_insitu.query("@mjd[0] <= mjd <= @mjd[-1]")[var_str+'_mu']
+            #         fo_samples.append(sample)
+            #     fo_samples = np.array(fo_samples)
+            #     return fo_samples
             
-            breakpoint()
+            # Assign to dict
+            gp_variables[target_var]['mean'] = new_var_mu
+            gp_variables[target_var]['std'] = new_var_sig
+            gp_variables[target_var]['cov'] = new_var_cov
             
-        return new_insitu, func
+        return gp_variables
                  
     def generate_backgroundSamples(self, num_samples):
         import gpflow
@@ -1112,8 +1125,11 @@ class multihuxt_inputs:
             vcarr_mu = np.nanmean(results, axis=0)
             vcarr_sig = np.sqrt(np.nanstd(results, axis=0)**2 + constant_sig**2)
             
+            # Get the left edges of longitude bins
+            lons = np.linspace(0, 360, vcarr_mu.shape[0]+1)[:-1]
             
             boundaryDistributions_dict[source] = {'t_grid': t,
+                                                  'lon_grid': lons, 
                                                   'U_mu_grid': vcarr_mu,
                                                   'U_sig_grid': vcarr_sig,
                                                   'B_grid': bcarr}
@@ -1152,7 +1168,7 @@ class multihuxt_inputs:
         # Coordinates = (lat, lon, time)
         # Values = boundary speed, magnetic field* (*not implemented fully)
         lat_for3d = np.linspace(-self.latmax.value, self.latmax.value, nLat)
-        lon_for3d = np.linspace(0, 360, nLon)
+        lon_for3d = np.linspace(0, 360, nLon+1)[:-1]
         mjd_for3d = self.boundaryDistributions['omni']['t_grid']
         
         if (type(extend) == str) & (GP == True):
@@ -1303,7 +1319,7 @@ class multihuxt_inputs:
         Xc_mu, Yc_mu = XYc_mu[:,:3], XYc_mu[:,3][:,None]
         Yc_mu_sigma = np.array([np.std(XY_mu[kmeans_mu.labels_ == i, 1]) 
                                 for i in range(kmeans_mu.n_clusters)])
-        Yc_mu_noise = np.percentile(Yc_mu_sigma, 50)**2
+        Yc_mu_noise = np.percentile(Yc_mu_sigma, 90)**2
         
         # Cluster for standard deviations
         XY_sigma = np.column_stack([X, Y_sigma])
@@ -1312,8 +1328,8 @@ class multihuxt_inputs:
         Xc_sigma, Yc_sigma = XYc_sigma[:,:3], XYc_sigma[:,3][:,None]
         Yc_sigma_sigma = np.array([np.std(XY_sigma[kmeans_sigma.labels_ == i, 1]) 
                                 for i in range(kmeans_sigma.n_clusters)])
-        Yc_sigma_noise = np.percentile(Yc_mu_sigma, 50)**2
-
+        Yc_sigma_noise = np.percentile(Yc_mu_sigma, 90)**2
+        
         # =============================================================================
         #         # Define kernel for each dimension separately, then altogether
         # =============================================================================
@@ -1338,6 +1354,8 @@ class multihuxt_inputs:
         # =============================================================================
         print("Optimizing GP Model... This may take some time.")
         print("Trying to optimize for {} point".format(len(Yc_mu)))
+        print("Current time: {}".format(datetime.datetime.now().strftime("%H:%M:%S")))
+        t0 = time.time()
         
         model_mu = gpflow.models.GPR((Xc_mu, Yc_mu),
                                      kernel=kernel_mu,
@@ -1351,6 +1369,8 @@ class multihuxt_inputs:
         opt_sigma = gpflow.optimizers.Scipy()
         opt_sigma.minimize(model_sigma.training_loss, model_sigma.trainable_variables)
         
+        print("Model optimization complete! Elapsed time: {:.0f} s".format(time.time() - t0))
+        
         # =============================================================================
         # Predict values for the full grid...     
         # =============================================================================
@@ -1362,7 +1382,7 @@ class multihuxt_inputs:
                                Xlon.flatten()[:,None],
                                Xmjd.flatten()[:,None]])
         
-        breakpoint()
+        # breakpoint()
         
         # Parallel chunk processing 
         nCores = int(0.75 * mp.cpu_count()) 
@@ -1384,8 +1404,8 @@ class multihuxt_inputs:
         
         # with warnings.catch_warnings():
         #     warnings.simplefilter("ignore", UserWarning)
-        import warnings
-        warnings.filterwarnings('ignore') 
+        # import warnings
+        # warnings.filterwarnings('ignore') 
         
         mu_generator = Parallel(return_as='generator', n_jobs=nCores)(
             delayed(process)(model_mu, X3d_chunk) 
@@ -1409,10 +1429,17 @@ class multihuxt_inputs:
         # Ysigmasigma = np.concatenate([elem[3] for elem in Y_chunklist], axis=0)
             
         U_mu = val_scaler.inverse_transform(Ymu)
-        U_sigma = val_scaler.scale_ * np.sqrt(Ysigma**2 + Ymusigma**2)
+        U_sigma = val_scaler.scale_ * Ysigma
+        # U_sigma = val_scaler.scale_ * np.sqrt(Ysigma**2 + Ymusigma**2)
+        
         
         U_mu_3d = U_mu.reshape(nLat, nLon, nMjd)
         U_sigma_3d = U_sigma.reshape(nLat, nLon, nMjd)
+        
+        # =============================================================================
+        # Generate the prediction for the clusters, then interpolate out?
+        # =============================================================================
+        
         
         # Generate an OBVIOUSLY WRONG B
         B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
@@ -1422,7 +1449,7 @@ class multihuxt_inputs:
         # =============================================================================
         # Visualization     
         # =============================================================================
-    
+        breakpoint()
         # for source in self.boundarySources:
             
         #     # Reconstruct the backmapped solar wind view at each source
@@ -1477,6 +1504,8 @@ class multihuxt_inputs:
         U_mu_2d = np.zeros(shape3D[1:])
         U_sigma_2d = np.zeros(shape3D[1:])
         
+        # breakpoint()
+        
         for i, target_lat in enumerate(target_lats):
             # Locate the nearest index to the target_lat
             # target_lat_indx = np.interp(target_lat,
@@ -1502,6 +1531,7 @@ class multihuxt_inputs:
         B_grid = self.boundaryDistributions3D['B_grid'][0,:,:]
         
         return {'t_grid': self.boundaryDistributions3D['t_grid'],
+                'lon_grid': self.boundaryDistributions3D['lon_grid'],
                 'U_mu_grid': U_mu_2d, 
                 'U_sig_grid': U_sigma_2d,
                 'B_grid': B_grid}
