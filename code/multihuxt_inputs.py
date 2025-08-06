@@ -1216,6 +1216,9 @@ class multihuxt_inputs:
         import multiprocessing as mp
         from joblib import Parallel, delayed
         
+        max_relative_error = 0.001
+        max_chunk_length = 2000
+        
         # Get dimensions from OMNI boundary distribution, which *must* exist
         nLat = len(lat_for3d)
         nLon = len(lon_for3d)
@@ -1229,7 +1232,7 @@ class multihuxt_inputs:
         lon_scaler.fit(lon_for3d[:,None])
         
         mjd_scaler = MinMaxScaler((0,1))
-        mjd_scaler.fit(self.boundaryDistributions['omni']['t_grid'][:,None])
+        mjd_scaler.fit(mjd_for3d[:,None])
 
         # All of the backmapped values
         val_scaler = StandardScaler()
@@ -1243,35 +1246,22 @@ class multihuxt_inputs:
         # lat, lon, mjd, val, = [], [], [], []
         for source in self.boundarySources:
             
-            # # lon does not vary with time
-            # lon_1d = np.linspace(0, 360, nLon)
-            # # lon_2d = np.tile(lon_1d, (n))
-            
-            # # lat does vary with time, so fill an array to match lon
-            # lat_0d = np.interp(self.boundaryDistributions[source]['t_grid'][i],
-            #                    self.backgroundDistributions[source]['mjd'],
-            #                    self.backgroundDistributions[source]['lat_HGI'])
-            # lat_1d = np.full_like(lon_1d, lat_0d)
-            
-            # mjd_0d = self.boundaryDistributions[source]['t_grid'][i]
-            
-            # lon.extend(lon_1d.flatten())
-            # lat.extend(lat_1d.flatten())
-            # val_1d = self.boundaryDistributions[source]['U_mu_grid'][:, i]
-            # val.extend(val_1d)
-            
-            lon_1d = np.linspace(0, 360, nLon)
+            lon_1d = self.boundaryDistributions[source]['lon_grid']
             mjd_1d = self.boundaryDistributions[source]['t_grid']
-            lat_1d = np.interp(self.boundaryDistributions[source]['t_grid'],
-                               self.backgroundDistributions['mjd'],
-                               self.backgroundDistributions[source]['lat_HGI'])
+            lat_1d = np.interp(mjd_1d, 
+                               self.ephemeris[source].time.mjd, 
+                               self.ephemeris[source].lat_c.to(u.deg).value)
             
             mjd_2d, lon_2d, = np.meshgrid(mjd_1d, lon_1d)
-            lat_2d = np.tile(lat_1d, (128, 1))
+            lat_2d = np.tile(lat_1d, (nLon, 1))
             
             val_mu_2d = self.boundaryDistributions[source]['U_mu_grid']
             val_sigma_2d = self.boundaryDistributions[source]['U_sig_grid']
             
+            
+            # We're going to transpose all of these 2D matrices
+            # So, when flattened, lon is the second (faster changing) dim
+            # And mjd/lat is the first (slower changing) dim
             lat.extend(lat_2d.flatten())
             lon.extend(lon_2d.flatten())
             mjd.extend(mjd_2d.flatten())
@@ -1300,37 +1290,6 @@ class multihuxt_inputs:
         yval_sigma = (1/val_scaler.scale_) * val_sigma[~np.isnan(val_sigma),None]
         
         # =============================================================================
-        #         # Find XY clusters to reduce number of points in GP
-        # =============================================================================
-        # print("OPTIMIZE DOWNSAMPLING BY Z-SCORE RMSE")
-        # breakpoint()
-        
-        # n_clusters = int(0.01 * len(yval_mu))
-        n_clusters = 2000
-        
-        X = np.column_stack([xlat, xlon, xmjd])
-        Y_mu = yval_mu
-        Y_sigma = yval_sigma
-        
-        # Cluster for means
-        XY_mu = np.column_stack([X, Y_mu])
-        kmeans_mu = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
-        XYc_mu = kmeans_mu.cluster_centers_
-        Xc_mu, Yc_mu = XYc_mu[:,:3], XYc_mu[:,3][:,None]
-        Yc_mu_sigma = np.array([np.std(XY_mu[kmeans_mu.labels_ == i, 1]) 
-                                for i in range(kmeans_mu.n_clusters)])
-        Yc_mu_noise = np.percentile(Yc_mu_sigma, 90)**2
-        
-        # Cluster for standard deviations
-        XY_sigma = np.column_stack([X, Y_sigma])
-        kmeans_sigma = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_sigma)
-        XYc_sigma = kmeans_sigma.cluster_centers_
-        Xc_sigma, Yc_sigma = XYc_sigma[:,:3], XYc_sigma[:,3][:,None]
-        Yc_sigma_sigma = np.array([np.std(XY_sigma[kmeans_sigma.labels_ == i, 1]) 
-                                for i in range(kmeans_sigma.n_clusters)])
-        Yc_sigma_noise = np.percentile(Yc_mu_sigma, 90)**2
-        
-        # =============================================================================
         #         # Define kernel for each dimension separately, then altogether
         # =============================================================================
         lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0])
@@ -1349,27 +1308,130 @@ class multihuxt_inputs:
         
         kernel_sigma = copy.deepcopy(kernel_mu)
         
+        # # =============================================================================
+        # # Chunking  
+        # # =============================================================================
+        # X = np.column_stack([xlat, xlon, xmjd])
+        # Y_mu = yval_mu
+        # Y_sigma = yval_sigma
+        
+        # XY_mu = np.column_stack([X, Y_mu])
+        # XY_sigma = np.column_stack([X, Y_sigma])
+        
+        # # Each chunk should be ~2000 long, with ~500 points overlapping
+        # n_chunks = len(XY_mu)/500 # Each chunk should be 2000ish points long
+        # test = np.array_split(XY_mu, int(n_chunks))
+        
+        # # [0:4], [3:7], [6:10], ...
+        # XY_mu_chunks = []
+        # for i in range(len(test)):
+        #     XY_mu_chunks.append(np.row_stack(test[i*3:i*3+4]))
+            
         # =============================================================================
-        #         Optimize
+        # ~Fancy~ Chunking  
         # =============================================================================
-        print("Optimizing GP Model... This may take some time.")
-        print("Trying to optimize for {} point".format(len(Yc_mu)))
-        print("Current time: {}".format(datetime.datetime.now().strftime("%H:%M:%S")))
-        t0 = time.time()
+        X = np.column_stack([xlat, xlon, xmjd])
+        Y_mu = yval_mu
+        Y_sigma = yval_sigma
         
-        model_mu = gpflow.models.GPR((Xc_mu, Yc_mu),
-                                     kernel=kernel_mu,
-                                     noise_variance=Yc_mu_noise)
-        opt_mu = gpflow.optimizers.Scipy()
-        opt_mu.minimize(model_mu.training_loss, model_mu.trainable_variables)
+        XY_mu = np.column_stack([X, Y_mu])
+        XY_sigma = np.column_stack([X, Y_sigma])
         
-        model_sigma = gpflow.models.GPR((Xc_sigma, Yc_sigma),
-                                        kernel=kernel_sigma,
-                                        noise_variance=Yc_sigma_noise)
-        opt_sigma = gpflow.optimizers.Scipy()
-        opt_sigma.minimize(model_sigma.training_loss, model_sigma.trainable_variables)
+        # Test values of n_clusters varying from clusters of size 5 to 40
+        n_points = len(Y_mu)
+        n_clusters_test = (n_points / np.arange(2, 100+5, 5)).astype(int)
         
-        print("Model optimization complete! Elapsed time: {:.0f} s".format(time.time() - t0))
+        inertia = []
+        for n_clusters in n_clusters_test:
+            kmeans_mu = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
+            inertia.append(kmeans_mu.inertia_)
+        
+        # Find the optimized number of clusters to meet our target rel. error
+        average_inertia = np.array(inertia)/n_points
+        n_clusters_optimized = np.interp(max_relative_error, average_inertia, n_clusters_test).astype(int)
+        
+        # Cluster data, then create chunks of clusters for optimization
+        
+        kmeans_mu = KMeans(n_clusters=n_clusters_optimized,
+                           random_state=0,
+                           n_init="auto").fit(XY_mu)
+        kmeans_sigma = KMeans(n_clusters=n_clusters_optimized,
+                              random_state=0,
+                              n_init="auto").fit(XY_sigma)
+        XYc_mu = kmeans_mu.cluster_centers_
+        XYc_sigma = kmeans_sigma.cluster_centers_
+        
+        n_chunks = int(np.ceil(n_clusters_optimized/max_chunk_length))
+        
+        mu_sort = np.argsort(XYc_mu[:,2]) # sort by MJD
+        XYc_mu_chunks = np.array_split(XYc_mu[mu_sort,:], n_chunks)
+        Xc_mu_chunks = [chunk[:,0:3] for chunk in XYc_mu_chunks]
+        Yc_mu_chunks = [chunk[:,3][:,None] for chunk in XYc_mu_chunks]
+        
+        sigma_sort = np.argsort(XYc_sigma[:,2]) # sort by MJD
+        XYc_sigma_chunks = np.array_split(XYc_sigma[sigma_sort,:], n_chunks)
+        Xc_sigma_chunks = [chunk[:,0:3] for chunk in XYc_sigma_chunks]
+        Yc_sigma_chunks = [chunk[:,3][:,None] for chunk in XYc_sigma_chunks]
+        
+        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, max_relative_error)
+        
+        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, max_relative_error)
+        
+        
+        
+        # # =============================================================================
+        # #         # Find XY clusters to reduce number of points in GP
+        # # =============================================================================
+        # # print("OPTIMIZE DOWNSAMPLING BY Z-SCORE RMSE")
+        
+        # # n_clusters = int(0.01 * len(yval_mu))
+        # n_clusters = 400 # 2000
+        
+        # X = np.column_stack([xlat, xlon, xmjd])
+        # Y_mu = yval_mu
+        # Y_sigma = yval_sigma
+        
+        # # Cluster for means
+        # XY_mu = np.column_stack([X, Y_mu])
+        # kmeans_mu = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
+        # XYc_mu = kmeans_mu.cluster_centers_
+        # Xc_mu, Yc_mu = XYc_mu[:,:3], XYc_mu[:,3][:,None]
+        # Yc_mu_sigma = np.array([np.std(XY_mu[kmeans_mu.labels_ == i, 1]) 
+        #                         for i in range(kmeans_mu.n_clusters)])
+        # Yc_mu_noise = np.percentile(Yc_mu_sigma, 90)**2
+        
+        # # Cluster for standard deviations
+        # XY_sigma = np.column_stack([X, Y_sigma])
+        # kmeans_sigma = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_sigma)
+        # XYc_sigma = kmeans_sigma.cluster_centers_
+        # Xc_sigma, Yc_sigma = XYc_sigma[:,:3], XYc_sigma[:,3][:,None]
+        # Yc_sigma_sigma = np.array([np.std(XY_sigma[kmeans_sigma.labels_ == i, 1]) 
+        #                         for i in range(kmeans_sigma.n_clusters)])
+        # Yc_sigma_noise = np.percentile(Yc_mu_sigma, 90)**2
+        
+
+        
+        # # =============================================================================
+        # #         Optimize
+        # # =============================================================================
+        # print("Optimizing GP Model... This may take some time.")
+        # print("Trying to optimize for {} point".format(len(Yc_mu)))
+        # print("Current time: {}".format(datetime.datetime.now().strftime("%H:%M:%S")))
+        # t0 = time.time()
+        
+        # model_mu = gpflow.models.GPR((Xc_mu, Yc_mu),
+        #                              kernel=kernel_mu,
+        #                              noise_variance=Yc_mu_noise)
+        # opt_mu = gpflow.optimizers.Scipy()
+        # opt_mu.minimize(model_mu.training_loss, model_mu.trainable_variables)
+        
+        # model_sigma = gpflow.models.GPR((Xc_sigma, Yc_sigma),
+        #                                 kernel=kernel_sigma,
+        #                                 noise_variance=Yc_sigma_noise)
+        # opt_sigma = gpflow.optimizers.Scipy()
+        # opt_sigma.minimize(model_sigma.training_loss, model_sigma.trainable_variables)
+        
+        # print("Model optimization complete! Elapsed time: {:.0f} s".format(time.time() - t0))
         
         # =============================================================================
         # Predict values for the full grid...     
@@ -1382,15 +1444,16 @@ class multihuxt_inputs:
                                Xlon.flatten()[:,None],
                                Xmjd.flatten()[:,None]])
         
-        # breakpoint()
-        
         # Parallel chunk processing 
+        # This is ~3x faster than non-parallel processing
+        print("Beginning Parallel Assignment")
+        t0 = time.time()
         nCores = int(0.75 * mp.cpu_count()) 
         chunksize = 5000
         X3d_chunks = [X3d[pos:pos + chunksize] for pos in range(0, len(X3d), chunksize)]
         
         def process(model, X3d_chunk):
-            Ymu_chunk, Ysigma2_chunk = model.predict_y(X3d_chunk)
+            Ymu_chunk, Ysigma2_chunk = model.predict_f(X3d_chunk)
             
             # Ymumu, Ymusigma2 = Ymu_chunk[:,0], Ymu_chunk[:,1]
             # Ymusigma = tf.sqrt(Ymusigma2)
@@ -1412,12 +1475,15 @@ class multihuxt_inputs:
             for X3d_chunk in X3d_chunks
             )
         Ymu_chunklist = list(tqdm.tqdm(mu_generator, total=len(X3d_chunks)))
+        print("Time elapsed: {:.1f} s".format(time.time() - t0))
         
         sigma_generator = Parallel(return_as='generator', n_jobs=nCores)(
             delayed(process)(model_sigma, X3d_chunk) 
             for X3d_chunk in X3d_chunks
             )
         Ysigma_chunklist = list(tqdm.tqdm(sigma_generator, total=len(X3d_chunks)))
+        
+        breakpoint()
         
         Ymu = np.concatenate([elem[0] for elem in Ymu_chunklist], axis=0)
         Ymusigma = np.concatenate([elem[1] for elem in Ymu_chunklist], axis=0)
@@ -1439,7 +1505,6 @@ class multihuxt_inputs:
         # =============================================================================
         # Generate the prediction for the clusters, then interpolate out?
         # =============================================================================
-        
         
         # Generate an OBVIOUSLY WRONG B
         B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
@@ -1937,6 +2002,88 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, inne
                                                      (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad),
                                                      innerbound)
     return vcarr_inner
+
+
+class GPFlowEnsemble:
+    def __init__(self, kernel, X_list, Y_list, noise_variance):
+    
+        # Given variables
+        self.kernel = kernel
+        self.X_list = X_list
+        self.Y_list = Y_list
+        self.noise_variance = noise_variance
+        
+        # Derived variables
+        self.nChunks = len(X_list)
+        
+        self.model_list = []
+        self.optimize_models()
+    
+    
+    def optimize_models(self):
+        import gpflow
+
+        print("Optimizing {} GP models".format(self.nChunks))
+        print("Current time: {}".format(datetime.datetime.now().strftime("%H:%M:%S")))
+        t0 = time.time()
+    
+        for i, (X, Y) in enumerate(zip(self.X_list, self.Y_list)):
+            print("Optimizing GP model #{} with {} points".format(i+1, len(X)))
+            t1 = time.time()
+    
+            model = gpflow.models.GPR((X, Y),
+                                      kernel=self.kernel,
+                                      noise_variance=self.noise_variance)
+    
+            opt = gpflow.optimizers.Scipy()
+            opt.minimize(model.training_loss, model.trainable_variables)
+            
+            self.model_list.append(model)
+            
+            print("Completed in {:.1f} s".format(time.time() - t1))
+            
+        print("All GP models optimized in {:.1f} s".format(time.time() - t0))
+        
+        return
+    
+    def predict_f(self, X_new):
+        
+        weights = self.calculate_weights(X_new)
+        
+        result_mu = np.full((len(X_new), 1), 0, dtype='float64')
+        result_sigma = np.full((len(X_new), 1), 0, dtype='float64')
+        for w, model in zip(weights, self.model_list):
+            f_mu, f_sigma = model.predict_f(X_new)
+            
+            result_mu += w[:,None] * f_mu.numpy()
+            result_sigma += w[:,None] * f_sigma.numpy()
+            
+        return result_mu, result_sigma
+    
+    def predict_f_samples(self, X_new, num_samples=1):
+        
+        weights = self.calculate_weights(X_new)
+        
+        result = np.full((num_samples, len(X_new), 1), 0, dtype='float64')
+        for w, model in zip(weights, self.model_list):
+            f = model.predict_f_samples(X_new, num_samples)
+            
+            result += np.tile(w[:,None], (num_samples, 1, 1)) * f.numpy()
+        
+        return result
+    
+    def calculate_weights(self, X_new):
+        import scipy
+        
+        X_centers = [np.mean(X, axis=0) for X in self.X_list]
+        
+        # Distances are n_chunks by n_X_new
+        distances = [np.linalg.norm(X_new - X_center, axis=1) for X_center in X_centers]
+        distances = np.stack(distances) 
+        
+        weights = scipy.special.softmax(-distances, axis=0)
+        
+        return weights
 
 # def _process_sample(df_sample, method_sample):
 #     sf_sample_copy = df_sample.copy(deep=True)
