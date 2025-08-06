@@ -1210,14 +1210,15 @@ class multihuxt_inputs:
     def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d):
         import gpflow
         import tensorflow as tf
-        from sklearn.preprocessing import StandardScaler, MinMaxScaler
+        from sklearn.preprocessing import StandardScaler, MinMaxScaler, FunctionTransformer
+        from sklearn.pipeline import Pipeline
         # from scipy.cluster.vq import kmeans
         from sklearn.cluster import KMeans
         import multiprocessing as mp
         from joblib import Parallel, delayed
         
-        max_relative_error = 0.001
-        max_chunk_length = 2000
+        mean_relative_error = 0.001
+        max_chunk_length = 1024
         
         # Get dimensions from OMNI boundary distribution, which *must* exist
         nLat = len(lat_for3d)
@@ -1234,16 +1235,16 @@ class multihuxt_inputs:
         mjd_scaler = MinMaxScaler((0,1))
         mjd_scaler.fit(mjd_for3d[:,None])
 
-        # All of the backmapped values
-        val_scaler = StandardScaler()
-        val_scaler.fit(np.array([v['U_mu_grid'] 
-                                 for _, v in self.boundaryDistributions.items()
-                                 ]).flatten()[:,None])
-        
-        # rng = np.random.default_rng()
-        # for i in range(nTime):
+        # Initialize value scalers for mean (mu) and standard deviation (sigma)
+        val_mu_scaler = StandardScaler()
+
+        val_sigma_scaler = Pipeline([
+            ('log_transform', FunctionTransformer(np.log1p, inverse_func=np.expm1)),
+            ('scaler', StandardScaler()),
+            ])
+
+        #
         lat, lon, mjd, val_mu, val_sigma, = [], [], [], [], []
-        # lat, lon, mjd, val, = [], [], [], []
         for source in self.boundarySources:
             
             lon_1d = self.boundaryDistributions[source]['lon_grid']
@@ -1277,18 +1278,22 @@ class multihuxt_inputs:
         lon = np.array(lon)
         lat = np.array(lat)
         mjd = np.array(mjd)
+        
         val_mu = np.array(val_mu)
         val_sigma = np.array(val_sigma)
-        # val = np.array(val)
+        # log_val_sigma = np.log10(val_sigma)
         
         # Normalizations & NaN removal
         xlat = lat_scaler.transform(lat[~np.isnan(val_mu),None])
         xlon = lon_scaler.transform(lon[~np.isnan(val_mu),None])
         xmjd = mjd_scaler.transform(mjd[~np.isnan(val_mu),None])
         
-        yval_mu = val_scaler.transform(val_mu[~np.isnan(val_mu),None])
-        yval_sigma = (1/val_scaler.scale_) * val_sigma[~np.isnan(val_sigma),None]
+        val_mu_scaler.fit(val_mu[:,None])
+        yval_mu = val_mu_scaler.transform(val_mu[~np.isnan(val_mu),None])
         
+        val_sigma_scaler.fit(val_sigma[:,None])
+        yval_sigma = val_sigma_scaler.transform(val_sigma[~np.isnan(val_mu),None])
+
         # =============================================================================
         #         # Define kernel for each dimension separately, then altogether
         # =============================================================================
@@ -1308,25 +1313,6 @@ class multihuxt_inputs:
         
         kernel_sigma = copy.deepcopy(kernel_mu)
         
-        # # =============================================================================
-        # # Chunking  
-        # # =============================================================================
-        # X = np.column_stack([xlat, xlon, xmjd])
-        # Y_mu = yval_mu
-        # Y_sigma = yval_sigma
-        
-        # XY_mu = np.column_stack([X, Y_mu])
-        # XY_sigma = np.column_stack([X, Y_sigma])
-        
-        # # Each chunk should be ~2000 long, with ~500 points overlapping
-        # n_chunks = len(XY_mu)/500 # Each chunk should be 2000ish points long
-        # test = np.array_split(XY_mu, int(n_chunks))
-        
-        # # [0:4], [3:7], [6:10], ...
-        # XY_mu_chunks = []
-        # for i in range(len(test)):
-        #     XY_mu_chunks.append(np.row_stack(test[i*3:i*3+4]))
-            
         # =============================================================================
         # ~Fancy~ Chunking  
         # =============================================================================
@@ -1373,66 +1359,10 @@ class multihuxt_inputs:
         Xc_sigma_chunks = [chunk[:,0:3] for chunk in XYc_sigma_chunks]
         Yc_sigma_chunks = [chunk[:,3][:,None] for chunk in XYc_sigma_chunks]
         
-        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, max_relative_error)
+        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, mean_relative_error*3)
         
-        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, max_relative_error)
-        
-        
-        
-        # # =============================================================================
-        # #         # Find XY clusters to reduce number of points in GP
-        # # =============================================================================
-        # # print("OPTIMIZE DOWNSAMPLING BY Z-SCORE RMSE")
-        
-        # # n_clusters = int(0.01 * len(yval_mu))
-        # n_clusters = 400 # 2000
-        
-        # X = np.column_stack([xlat, xlon, xmjd])
-        # Y_mu = yval_mu
-        # Y_sigma = yval_sigma
-        
-        # # Cluster for means
-        # XY_mu = np.column_stack([X, Y_mu])
-        # kmeans_mu = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
-        # XYc_mu = kmeans_mu.cluster_centers_
-        # Xc_mu, Yc_mu = XYc_mu[:,:3], XYc_mu[:,3][:,None]
-        # Yc_mu_sigma = np.array([np.std(XY_mu[kmeans_mu.labels_ == i, 1]) 
-        #                         for i in range(kmeans_mu.n_clusters)])
-        # Yc_mu_noise = np.percentile(Yc_mu_sigma, 90)**2
-        
-        # # Cluster for standard deviations
-        # XY_sigma = np.column_stack([X, Y_sigma])
-        # kmeans_sigma = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_sigma)
-        # XYc_sigma = kmeans_sigma.cluster_centers_
-        # Xc_sigma, Yc_sigma = XYc_sigma[:,:3], XYc_sigma[:,3][:,None]
-        # Yc_sigma_sigma = np.array([np.std(XY_sigma[kmeans_sigma.labels_ == i, 1]) 
-        #                         for i in range(kmeans_sigma.n_clusters)])
-        # Yc_sigma_noise = np.percentile(Yc_mu_sigma, 90)**2
-        
+        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, mean_relative_error*3)
 
-        
-        # # =============================================================================
-        # #         Optimize
-        # # =============================================================================
-        # print("Optimizing GP Model... This may take some time.")
-        # print("Trying to optimize for {} point".format(len(Yc_mu)))
-        # print("Current time: {}".format(datetime.datetime.now().strftime("%H:%M:%S")))
-        # t0 = time.time()
-        
-        # model_mu = gpflow.models.GPR((Xc_mu, Yc_mu),
-        #                              kernel=kernel_mu,
-        #                              noise_variance=Yc_mu_noise)
-        # opt_mu = gpflow.optimizers.Scipy()
-        # opt_mu.minimize(model_mu.training_loss, model_mu.trainable_variables)
-        
-        # model_sigma = gpflow.models.GPR((Xc_sigma, Yc_sigma),
-        #                                 kernel=kernel_sigma,
-        #                                 noise_variance=Yc_sigma_noise)
-        # opt_sigma = gpflow.optimizers.Scipy()
-        # opt_sigma.minimize(model_sigma.training_loss, model_sigma.trainable_variables)
-        
-        # print("Model optimization complete! Elapsed time: {:.0f} s".format(time.time() - t0))
-        
         # =============================================================================
         # Predict values for the full grid...     
         # =============================================================================
@@ -1483,21 +1413,19 @@ class multihuxt_inputs:
             )
         Ysigma_chunklist = list(tqdm.tqdm(sigma_generator, total=len(X3d_chunks)))
         
-        breakpoint()
-        
         Ymu = np.concatenate([elem[0] for elem in Ymu_chunklist], axis=0)
         Ymusigma = np.concatenate([elem[1] for elem in Ymu_chunklist], axis=0)
         Ysigma = np.concatenate([elem[0] for elem in Ysigma_chunklist], axis=0)
+        Ysigmasigma = np.concatenate([elem[1] for elem in Ysigma_chunklist], axis=0)
         
         # Ymumu = np.concatenate([elem[0] for elem in Y_chunklist], axis=0)
         # Ymusigma = np.concatenate([elem[1] for elem in Y_chunklist], axis=0)
         # Ysigmamu = np.concatenate([elem[2] for elem in Y_chunklist], axis=0)
         # Ysigmasigma = np.concatenate([elem[3] for elem in Y_chunklist], axis=0)
             
-        U_mu = val_scaler.inverse_transform(Ymu)
-        U_sigma = val_scaler.scale_ * Ysigma
-        # U_sigma = val_scaler.scale_ * np.sqrt(Ysigma**2 + Ymusigma**2)
-        
+        U_mu = val_mu_scaler.inverse_transform(Ymu)
+        # U_sigma = np.sqrt(val_sigma_scaler.inverse_transform(Ysigma)**2 + (val_mu_scaler.scale_ * Ymusigma)**2)
+        U_sigma = val_sigma_scaler.inverse_transform(Ysigma)
         
         U_mu_3d = U_mu.reshape(nLat, nLon, nMjd)
         U_sigma_3d = U_sigma.reshape(nLat, nLon, nMjd)
