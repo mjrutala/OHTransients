@@ -129,6 +129,7 @@ class multihuxt_inputs:
         # Required initializations
         # Other methods check that these are None (or have value) before 
         # continuing, so they must be intialized here
+        self._availableSources = None
         self._boundarySources = None
         self._ephemeris = {}
         
@@ -173,9 +174,16 @@ class multihuxt_inputs:
     
     @property
     def availableSources(self):
-        availableSources = set(self.availableBackgroundData.columns.get_level_values(0))
-        availableSources = set(availableSources) - {'mjd'}
-        return sorted(availableSources)
+        if self._availableSources is None:
+            availableSources = set(self.availableBackgroundData.columns.get_level_values(0))
+            availableSources = set(availableSources) - {'mjd'}
+            self._availableSources = sorted(availableSources)
+        return self._availableSources
+    
+    @availableSources.setter
+    def availableSources(self, addedSources):
+        self._availableSources.extend(addedSources)
+        self._availableSources = sorted(self._availableSources)
         
     # @property
     # def boundarySources(self):
@@ -603,7 +611,7 @@ class multihuxt_inputs:
         
         return synodic_period
 
-    def generate_backgroundDistributions(self, insitu=None, ICME_df=None, 
+    def generate_backgroundDistributions_old(self, insitu=None, ICME_df=None, 
                                          chunking=(60,30), average_cluster_span=6,
                                          inducing_variable=True,
                                          simple=False):
@@ -828,123 +836,421 @@ class multihuxt_inputs:
         
         return
     
-    def ambient_solar_wind_GP(self, df, average_cluster_span, carrington_period,
-                              inducing_variable=False, target_variables=['U']):
-        from sklearn.preprocessing import StandardScaler, MinMaxScaler
+    def generate_backgroundDistributions(self, insitu=None, ICME_df=None, 
+                                         inducing_variable=True,
+                                         GP = False, extend = False,
+                                         cluster_distance_limit = 0.001,
+                                         max_chunk_length = 1024,
+                                         num_samples = 0):
+        target_variables = ['U']
+        
+        # Calculate the span from stop - start
+        span = (self.stop - self.start).total_seconds() * u.s
+        simspan = (self.simstop - self.simstart).total_seconds() * u.s
+        
+        
+        
+        n_data = len(self.availableBackgroundData)
+        
+        # ambient_solar_wind_d = {k: {v: {'mean': np.full([n_data, n_chunks], np.nan), 
+        #                                 'std': np.full([n_data, n_chunks], np.nan), 
+        #                                 'cov': np.full([n_data, n_data, n_chunks], np.nan)} 
+        #                             for v in target_variables} 
+        #                         for k in self.boundarySources}
+        
+        all_summary = {}
+        all_samples = {}
+        
+        for source in self.boundarySources:
+            
+            # If indexICME is not supplied, look it up
+            if ICME_df is None:
+                indexICME = self.get_indexICME(source)
+            else:
+                indexICME = ICME_df[source]
+            
+            # Where an ICME is present, set U, BR to NaN
+            insitu_noICME = self.availableBackgroundData[source]
+            insitu_noICME['mjd'] = self.availableBackgroundData['mjd']
+            insitu_noICME.loc[indexICME, ['U', 'BR']] = np.nan
+            
+            new_insitu_list = []
+            covariance_list = []
+            # sample_func_df = pd.DataFrame(columns=['start_mjd', 'stop_mjd', 'func'])
+            
+            # Pass the insitu DataFrame to the correct parser
+            if (type(extend) == str) & (GP == True):
+                print("Cannot have extend=str and GP=True!")
+                return
+            if type(extend) == str:
+                print("Skipping GPR!")
+                summary, samples = self._extend_backgroundDistributions(insitu_noICME,
+                    target_variables=['U'],
+                    num_samples=num_samples)
+            elif GP is True:
+                carrington_period = self.get_carringtonPeriod(self.ephemeris[source].r.mean())
+                
+                summary, samples = self._impute_backgroundDistributions(insitu_noICME, 
+                    carrington_period,
+                    target_variables=target_variables, 
+                    cluster_distance_limit=cluster_distance_limit,
+                    max_chunk_length=max_chunk_length,
+                    num_samples=num_samples)
+            else:
+                print("You must set either GP or extend!")
+                return
+            
+            # Cast res and samples into full dfs
+            full_summary = insitu_noICME.copy(deep=True)
+            full_summary.drop(columns=target_variables, inplace=True)
+            for target_var in target_variables:
+                full_summary[target_var+'_mu'] = summary[target_var+'_mu']
+                full_summary[target_var+'_sigma'] = summary[target_var+'_sigma']
+            
+            full_samples = []
+            for i in range(num_samples):
+                full_sample_df = insitu_noICME.copy(deep=True)
+                for target_var in target_variables:
+                    full_sample_df[target_var] = samples[i][target_var]
+                    
+                full_samples.append(full_sample_df)
+            
+            # Add to dictionary with source
+            all_summary[source] = full_summary
+            all_samples[source] = full_samples
+            
+        bD = pd.concat(all_summary, axis=1)
+        bD['mjd'] = self.availableBackgroundData['mjd']
+        self.backgroundDistributions = bD
+        
+        bS = [pd.concat(dict(zip(all_samples.keys(), vals_by_sample)), axis=1) 
+              for vals_by_sample in zip(*all_samples.values())]
+        for i in range(len(bS)):
+            bS[i]['mjd'] = self.availableBackgroundData['mjd']
+        self.backgroundSamples = bS
+        # self.backgroundCovariances = backgroundCovariances
+        
+        # =============================================================================
+        # Visualization
+        # =============================================================================
+        fig, axs = plt.subplots(nrows=len(self.boundarySources), sharex=True, sharey=True,
+                                figsize=(6, 4.5))
+        plt.subplots_adjust(bottom=(0.16), left=(0.12), top=(1-0.08), right=(1-0.06),
+                            hspace=0)
+        if len(self.boundarySources) == 1:
+            axs = [axs]
+        for ax, source in zip(axs, self.boundarySources):
+            
+            ax.scatter(self.availableBackgroundData['mjd'], self.availableBackgroundData[(source, 'U')],
+                       color='black', marker='.', s=2, zorder=3,
+                       label = 'Raw Data')
+            # ax.scatter(self.availableBackgroundData.loc[indexICME, 'mjd'], 
+            #            self.availableBackgroundData.loc[indexICME, (source, 'U')],
+            #            edgecolor='xkcd:scarlet', marker='o', s=6, zorder=2, facecolor='None', lw=0.5,
+            #            label = 'ICMEs from DONKI')
+            
+            # If indexICME is not supplied, look it up
+            if ICME_df is None:
+                indexICME = self.get_indexICME(source)
+            else:
+                indexICME = ICME_df[source]
+            onlyICMEs = self.availableBackgroundData.copy(deep=True)
+            onlyICMEs.loc[~indexICME, :] = np.nan
+            # ax.plot(onlyICMEs['mjd'], 
+            #         onlyICMEs[(source, 'U')],
+            #         color='xkcd:ruby', zorder=2, lw=2,
+            #         label = 'DONKI ICMEs')
+            ax.scatter(onlyICMEs['mjd'], 
+                       onlyICMEs[(source, 'U')],
+                       color='xkcd:bright blue', zorder=3, marker='x', s=4, lw=1,
+                       label = 'DONKI ICMEs')
+            
+            #ax.scatter(Xc, Yc, label='Inducing Points', color='C1', marker='o', s=6, zorder=4)
+        
+            ax.plot(self.backgroundDistributions['mjd'], 
+                    self.backgroundDistributions[(source, 'U_mu')], 
+                    label="GP Prediction", color='xkcd:pumpkin', lw=1.5, zorder=3)
+            ax.fill_between(
+                    self.backgroundDistributions['mjd'],
+                    (self.backgroundDistributions[(source, 'U_mu')] - 1.96 * self.backgroundDistributions[(source, 'U_sigma')]),
+                    (self.backgroundDistributions[(source, 'U_mu')] + 1.96 * self.backgroundDistributions[(source, 'U_sigma')]),
+                    alpha=0.33, color='xkcd:pumpkin',
+                    label=r"95% CI", zorder=0)
+            
+            # for fo_sample in fo_samples:
+            #     ax.plot(Xo.ravel(), fo_sample.ravel(), lw=1, color='C3', alpha=0.2, zorder=-1)
+            # ax.plot(Xo.ravel()[0:1], fo_sample.ravel()[0:1], lw=1, color='C3', alpha=1, 
+            #         label = 'Samples about Mean')
+        
+            # ax.legend(scatterpoints=3, loc='upper right')
+            
+            ax.grid(True, which='major', axis='x',
+                    color='black', ls=':', alpha=0.5)
+            ax.annotate(source, (0, 1), (1,-1), 
+                        xycoords='axes fraction', textcoords='offset fontsize',
+                        ha='left', va='top',
+                        color='xkcd:black')
+        
+        axs[0].legend(loc='lower left', bbox_to_anchor=(0., 1.05, 1.0, 0.1),
+                      ncols=4, mode="expand", borderaxespad=0.,
+                      scatterpoints=3, markerscale=2)
+        ax.set(xlim=[self.starttime.mjd, self.stoptime.mjd],
+               ylim=[250, 850])
+        ax.secondary_xaxis(-0.23, 
+                           functions=(lambda x: x-self.starttime.mjd, lambda x: x+self.starttime.mjd))
+        
+        fig.supxlabel('Date [MJD]; Days from {}'.format(datetime.datetime.strftime(self.start, '%Y-%m-%d %H:%M')))
+        fig.supylabel('Solar Wind Speed [km/s]')
+        
+        plt.show()
+        
+        return
+    
+    def _impute_backgroundDistributions(self, df, carrington_period,
+                                        target_variables = ['U', 'Br'],
+                                        cluster_distance_limit = 1e-3,
+                                        max_chunk_length = 1024,
+                                        num_samples = 0):
         import gpflow
+        import tensorflow as tf
+        from sklearn.preprocessing import StandardScaler, MinMaxScaler, FunctionTransformer
+        from sklearn.pipeline import Pipeline
+        # from scipy.cluster.vq import kmeans
         from sklearn.cluster import KMeans
+        import multiprocessing as mp
+        from joblib import Parallel, delayed
         
-        # Check that all target_variables are present
-        for target_variable in target_variables:
-            if df[target_variable].isna().all() == True:
-                print("All variables are NaNs; cannot proceed with GPR")
-                return None, None
+        backgroundDistribution_df = pd.DataFrame(index=df.index)
+        backgroundSamples = [backgroundDistribution_df.copy() for _ in range(num_samples)]
+        for target_var in target_variables:
         
-        # Set up dictionaries 
-        gp_variables = {k: {} for k in target_variables}
-        
-        for target_variable in target_variables:
-                
-            # Get the mjd and U as column vectors for GPR
-            df_nonan = df.dropna(axis='index', how='any', subset=['U'])
-            mjd = df_nonan['mjd'].to_numpy(float)[:, None]
-            var = df_nonan[target_variable].to_numpy(float)[:, None]
-    
-            # MJD scaled to 1-day increments
-            mjd_rescaler = MinMaxScaler((0, mjd[-1]-mjd[0]))
-            mjd_rescaler.fit(mjd)
-            X = mjd_rescaler.transform(mjd)
+            # Set up value scalers
+            mjd_scaler = MinMaxScaler()
+            mjd_scaler.fit(df['mjd'].to_numpy()[:,None])
+            
+            val_scaler = StandardScaler()
+            val_scaler.fit(df[target_var].to_numpy()[:,None])
+            
+            # Normalizations & NaN removal
+            def_indx = ~df['U'].isna().to_numpy()
+            xmjd = mjd_scaler.transform(df['mjd'].to_numpy()[def_indx,None])
+            yval = val_scaler.transform(df[target_var].to_numpy()[def_indx,None])
+            
+            # =================================================================
+            # Define kernel for each dimension separately, then altogether
+            # =================================================================
+            period_rescaled = carrington_period.to(u.day).value * mjd_scaler.scale_[0]
+            period_gp = gpflow.Parameter(period_rescaled, trainable=False)
+            
+            base_kernel = gpflow.kernels.RationalQuadratic(lengthscales=0.1)
+            amplitude_kernel = gpflow.kernels.RationalQuadratic(lengthscales=0.1)
+            period_kernel = gpflow.kernels.Periodic(
+                gpflow.kernels.SquaredExponential(lengthscales=period_gp),
+                period=period_gp)
+            
+            kernel = base_kernel + amplitude_kernel * period_kernel
+            
+            # =============================================================================
+            # ~Fancy~ Chunking  
+            # =============================================================================
+            X = xmjd
+            Y = yval
+            
+            XY = np.column_stack([X, Y])
+            
+            # Test values of n_clusters varying from clusters of size 5 to 40
+            n_points = len(Y)
+            n_clusters_test = (n_points / np.logspace(0, 2, 20)).astype(int)
+            
+            # inertia = []
+            distances_90p = []
+            for n_clusters in tqdm.tqdm(n_clusters_test, desc='Optimizing Clustering for GP'):
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY)
+                # inertia.append(kmeans.inertia_)
+                kmeans_distances = []
+                for i in range(kmeans.n_clusters):
+                    diff = XY[kmeans.labels_==i,:] - kmeans.cluster_centers_[i]
+                    _kmeans_distances = np.linalg.norm(diff, axis=1)
+                    kmeans_distances.extend(_kmeans_distances)
+                distances_90p.append(np.percentile(kmeans_distances, 90))
+            
+            # Find the optimized number of clusters to meet our target rel. error
+            # average_inertia = np.array(inertia)/n_points
+            n_clusters_optimized = np.interp(cluster_distance_limit, distances_90p, n_clusters_test).astype(int)
+            
+            # Cluster data, then create chunks of clusters for optimization
+            kmeans = KMeans(n_clusters=n_clusters_optimized,
+                            random_state=0,
+                            n_init="auto").fit(XY)
+            
+            kmeans_distances = []
+            for i in range(kmeans.n_clusters):
+                _kmeans_distances = np.linalg.norm(XY[kmeans.labels_==i,:] - kmeans.cluster_centers_[i], axis=1)
+                kmeans_distances.extend(_kmeans_distances)
 
-            # Variable rescaled to z-score
-            var_rescaler = StandardScaler()
-            var_rescaler.fit(var)
-            Y = var_rescaler.transform(var)
-    
-            # K-means cluster the data (fewer data = faster processing)
-            # And calculate the variance within each cluster
-            XY = np.array(list(zip(X.flatten(), Y.flatten())))
-            chunk_span = (df_nonan.index[-1] - df_nonan.index[0]).total_seconds() * u.s
-            n_clusters = int((chunk_span / average_cluster_span).decompose())
             
-            if n_clusters < len(XY):
-                kmeans = KMeans(n_clusters=n_clusters, n_init="auto").fit(XY)
-                XYc = kmeans.cluster_centers_
-                # # This requires each cluster to have multiple points, which is not guaranteed
-                # # Instead, use the length scale as a guess at uncertaintys
-                Yc_var = np.array([np.var(XY[kmeans.labels_ == i, 1]) 
-                                   for i in range(kmeans.n_clusters)])
-                approx_noise = np.percentile(Yc_var, 90)
-            else:
-                n_clusters = len(XY)
-                XYc = XY
-                # 1/10 the overall standard deviation of Y
-                # Yc_var = np.array([0.1]*len(XY))
-                approx_noise = 0.1
-            print("{} clusters to be fit".format(len(XYc)))
-
+            XYc = kmeans.cluster_centers_
             
-            # Arrange clusters to be strictly increasing in time (X)
-            Xc, Yc = XYc.T[0], XYc.T[1]
-            cluster_sort = np.argsort(Xc)
-            Xc = Xc[cluster_sort][:, None]
-            Yc = Yc[cluster_sort][:, None]
-            Yc_var = Yc_var[cluster_sort][:, None]
-    
-            # Construct the signal kernel for GP
-            # Again, these lengthscales could probable be calculated?
-            # small_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=1.0)
-            # large_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=10.0)
-            # irregularities_kernel = gpflow.kernels.SquaredExponential(variance=1**2, lengthscales=1.0)
-            # # Fixed period Carrington rotation kernel
-            # period_rescaled = 100 / (simspan / carrington_period).decompose().value
-            # carrington_kernel = gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(), 
-            #                                             period=gpflow.Parameter(period_rescaled, trainable=False))
-    
-            # signal_kernel = small_scale_kernel + large_scale_kernel + irregularities_kernel + carrington_kernel
+            n_chunks = int(np.ceil(n_clusters_optimized/max_chunk_length))
             
-            # New kernel
-            period_rescaled = carrington_period.to(u.day).value
-            signal_kernel = gpflow.kernels.RationalQuadratic() + \
-                            gpflow.kernels.RationalQuadratic() * \
-                            gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(),
-                                                    period=gpflow.Parameter(period_rescaled, trainable=False)) 
+            sort = np.argsort(XYc[:,0]) # sort by MJD
+            XYc_chunks = np.array_split(XYc[sort,:], n_chunks)
+            Xc_chunks = [chunk[:,0][:,None] for chunk in XYc_chunks]
+            Yc_chunks = [chunk[:,1][:,None] for chunk in XYc_chunks]
             
-            # This model *could* be solved with the exact noise for each point...
-            # But this would require defining a custom likelihood class...
-            if inducing_variable == False:
-                model = gpflow.models.GPR((Xc, Yc), 
-                                          kernel=copy.deepcopy(signal_kernel), 
-                                          noise_variance=approx_noise
-                                          )
-            else:
-                model = gpflow.models.SGPR((X, Y), 
-                                           kernel=copy.deepcopy(signal_kernel), 
-                                           noise_variance=approx_noise,
-                                           inducing_variable=Xc)
+            # =============================================================================
+            # Plug into the ensemble GP model
+            # =============================================================================
+            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, cluster_distance_limit)
+            # model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, None)
+            
+            # =================================================================
+            # Get predictions for all MJD (filling in gaps)
+            # and inverse transform
+            # =================================================================
+            Xo = mjd_scaler.transform(df['mjd'].to_numpy()[:, None])
+            fo_mu, fo_var = model.predict_f(Xo)
+            fo_sig = np.sqrt(fo_var)
+            yo_mu, yo_var = model.predict_y(Xo)
+            yo_sig = np.sqrt(yo_var)
+            
+            fo_samples = model.predict_f_samples(Xo, num_samples)
+            
+            mjd = df['mjd'].to_numpy()
+            val_f_mu = val_scaler.inverse_transform(fo_mu).flatten()
+            val_f_sigma = (val_scaler.scale_ * fo_sig).flatten()
+            val_f_samples = [val_scaler.inverse_transform(fo).flatten() for fo in fo_samples]
+            val_y_mu = val_scaler.inverse_transform(yo_mu).flatten()
+            val_y_sigma = (val_scaler.scale_ * yo_sig).flatten()
+            
+            backgroundDistribution_df['mjd'] = mjd
+            backgroundDistribution_df[target_var+'_mu'] = val_f_mu
+            backgroundDistribution_df[target_var+'_sigma'] = val_f_sigma
+            
+            for i in range(num_samples):
+                backgroundSamples[i]['mjd'] = mjd
+                backgroundSamples[i][target_var] = val_f_samples[i]
                 
-            opt = gpflow.optimizers.Scipy()
-            opt.minimize(model.training_loss, model.trainable_variables)
+        return backgroundDistribution_df, backgroundSamples
             
-            # gpflow.utilities.print_summary(model)
+        
+    # def ambient_solar_wind_GP(self, df, average_cluster_span, carrington_period,
+    #                           inducing_variable=False, target_variables=['U']):
+    #     from sklearn.preprocessing import StandardScaler, MinMaxScaler
+    #     import gpflow
+    #     from sklearn.cluster import KMeans
+        
+    #     # Check that all target_variables are present
+    #     for target_variable in target_variables:
+    #         if df[target_variable].isna().all() == True:
+    #             print("All variables are NaNs; cannot proceed with GPR")
+    #             return None, None
+        
+    #     # Set up dictionaries 
+    #     gp_variables = {k: {} for k in target_variables}
+        
+    #     for target_variable in target_variables:
+                
+    #         # Get the mjd and U as column vectors for GPR
+    #         df_nonan = df.dropna(axis='index', how='any', subset=['U'])
+    #         mjd = df_nonan['mjd'].to_numpy(float)[:, None]
+    #         var = df_nonan[target_variable].to_numpy(float)[:, None]
+    
+    #         # MJD scaled to 1-day increments
+    #         mjd_rescaler = MinMaxScaler((0, mjd[-1]-mjd[0]))
+    #         mjd_rescaler.fit(mjd)
+    #         X = mjd_rescaler.transform(mjd)
+
+    #         # Variable rescaled to z-score
+    #         var_rescaler = StandardScaler()
+    #         var_rescaler.fit(var)
+    #         Y = var_rescaler.transform(var)
+    
+    #         # K-means cluster the data (fewer data = faster processing)
+    #         # And calculate the variance within each cluster
+    #         XY = np.array(list(zip(X.flatten(), Y.flatten())))
+    #         chunk_span = (df_nonan.index[-1] - df_nonan.index[0]).total_seconds() * u.s
+    #         n_clusters = int((chunk_span / average_cluster_span).decompose())
             
-            Xo = mjd_rescaler.transform(df['mjd'].to_numpy()[:, None])
-            
-            Yo_mu, Yo_var = model.predict_y(Xo)
-            Yo_mu, Yoc_var = np.array(Yo_mu), np.array(Yo_var)
-            Yo_sig = np.sqrt(Yo_var)
-            _, cov = model.predict_f(Xo, full_cov=True)
-            
-            new_mjd = mjd_rescaler.inverse_transform(Xo)
-            new_var_mu = var_rescaler.inverse_transform(Yo_mu)
-            new_var_sig= Yo_sig * var_rescaler.scale_
-            new_var_cov = cov * var_rescaler.scale_
-            
-            # Assign to dict
-            gp_variables[target_variable]['mean'] = new_var_mu.ravel()
-            gp_variables[target_variable]['std'] = new_var_sig.ravel()
-            gp_variables[target_variable]['cov'] = new_var_cov.numpy().squeeze()
-            
-        return gp_variables
+    #         if n_clusters < len(XY):
+    #             kmeans = KMeans(n_clusters=n_clusters, n_init="auto").fit(XY)
+    #             XYc = kmeans.cluster_centers_
+    #             # # This requires each cluster to have multiple points, which is not guaranteed
+    #             # # Instead, use the length scale as a guess at uncertaintys
+    #             Yc_var = np.array([np.var(XY[kmeans.labels_ == i, 1]) 
+    #                                for i in range(kmeans.n_clusters)])
+    #             approx_noise = np.percentile(Yc_var, 90)
+    #         else:
+    #             n_clusters = len(XY)
+    #             XYc = XY
+    #             # 1/10 the overall standard deviation of Y
+    #             # Yc_var = np.array([0.1]*len(XY))
+    #             approx_noise = 0.1
+    #         print("{} clusters to be fit".format(len(XYc)))
+    #
+    #        
+    #         # Arrange clusters to be strictly increasing in time (X)
+    #         Xc, Yc = XYc.T[0], XYc.T[1]
+    #         cluster_sort = np.argsort(Xc)
+    #         Xc = Xc[cluster_sort][:, None]
+    #         Yc = Yc[cluster_sort][:, None]
+    #         Yc_var = Yc_var[cluster_sort][:, None]
+    #
+    #         # Construct the signal kernel for GP
+    #         # Again, these lengthscales could probable be calculated?
+    #         # small_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=1.0)
+    #         # large_scale_kernel = gpflow.kernels.SquaredExponential(variance=2**2, lengthscales=10.0)
+    #         # irregularities_kernel = gpflow.kernels.SquaredExponential(variance=1**2, lengthscales=1.0)
+    #         # # Fixed period Carrington rotation kernel
+    #         # period_rescaled = 100 / (simspan / carrington_period).decompose().value
+    #         # carrington_kernel = gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(), 
+    #         #                                             period=gpflow.Parameter(period_rescaled, trainable=False))
+    #
+    #         # signal_kernel = small_scale_kernel + large_scale_kernel + irregularities_kernel + carrington_kernel
+    #        
+    #         # New kernel
+    #         period_rescaled = carrington_period.to(u.day).value
+    #         signal_kernel = gpflow.kernels.RationalQuadratic() + \
+    #                         gpflow.kernels.RationalQuadratic() * \
+    #                         gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(),
+    #                                                 period=gpflow.Parameter(period_rescaled, trainable=False)) 
+    #        
+    #         # This model *could* be solved with the exact noise for each point...
+    #         # But this would require defining a custom likelihood class...
+    #         if inducing_variable == False:
+    #             model = gpflow.models.GPR((Xc, Yc), 
+    #                                       kernel=copy.deepcopy(signal_kernel), 
+    #                                       noise_variance=approx_noise
+    #                                       )
+    #         else:
+    #             model = gpflow.models.SGPR((X, Y), 
+    #                                        kernel=copy.deepcopy(signal_kernel), 
+    #                                        noise_variance=approx_noise,
+    #                                        inducing_variable=Xc)
+    #            
+    #         opt = gpflow.optimizers.Scipy()
+    #         opt.minimize(model.training_loss, model.trainable_variables)
+    #        
+    #         # gpflow.utilities.print_summary(model)
+    #        
+    #         Xo = mjd_rescaler.transform(df['mjd'].to_numpy()[:, None])
+    #        
+    #         Yo_mu, Yo_var = model.predict_y(Xo)
+    #         Yo_mu, Yoc_var = np.array(Yo_mu), np.array(Yo_var)
+    #         Yo_sig = np.sqrt(Yo_var)
+    #         _, cov = model.predict_f(Xo, full_cov=True)
+    #        
+    #         new_mjd = mjd_rescaler.inverse_transform(Xo)
+    #         new_var_mu = var_rescaler.inverse_transform(Yo_mu)
+    #         new_var_sig= Yo_sig * var_rescaler.scale_
+    #         new_var_cov = cov * var_rescaler.scale_
+    #        
+    #         # Assign to dict
+    #         gp_variables[target_variable]['mean'] = new_var_mu.ravel()
+    #         gp_variables[target_variable]['std'] = new_var_sig.ravel()
+    #         gp_variables[target_variable]['cov'] = new_var_cov.numpy().squeeze()
+    #        
+    #     return gp_variables
     
     def ambient_solar_wind_LI(self, df, target_variables=['U']):
         
@@ -988,82 +1294,82 @@ class multihuxt_inputs:
             
         return gp_variables
                  
-    def generate_backgroundSamples(self, num_samples):
-        import gpflow
-        from sklearn.preprocessing import StandardScaler, MinMaxScaler
+    # def generate_backgroundSamples(self, num_samples):
+    #     import gpflow
+    #     from sklearn.preprocessing import StandardScaler, MinMaxScaler
         
-        # Check that the sampler functions have been defined
-        try: 
-            keys = self.backgroundCovariances.keys()
-        except:
-            print("generate_backgroundDistributions() must be run before background samples can be generated")
+    #     # Check that the sampler functions have been defined
+    #     try: 
+    #         keys = self.backgroundCovariances.keys()
+    #     except:
+    #         print("generate_backgroundDistributions() must be run before background samples can be generated")
         
-        # Check if we've already generated some samples?
-        # breakpoint()
+    #     # Check if we've already generated some samples?
+    #     # breakpoint()
         
-        # Set up a list of sample dataframes ahead of time
-        backgroundSamples = [self.backgroundDistributions.copy(deep=True) for _ in range(num_samples)]            
+    #     # Set up a list of sample dataframes ahead of time
+    #     backgroundSamples = [self.backgroundDistributions.copy(deep=True) for _ in range(num_samples)]            
         
-        # Try my hand at sampling the covariance matrix directly
-        for source in self.boundarySources:
-            for var, vals in self.backgroundCovariances[source].items():
+    #     # Try my hand at sampling the covariance matrix directly
+    #     for source in self.boundarySources:
+    #         for var, vals in self.backgroundCovariances[source].items():
                 
-                time_list = vals['time']
-                mu_list = vals['mean']
-                std_list = vals['std']
-                cov_list = vals['cov']
+    #             time_list = vals['time']
+    #             mu_list = vals['mean']
+    #             std_list = vals['std']
+    #             cov_list = vals['cov']
                 
-                rng = np.random.default_rng()
+    #             rng = np.random.default_rng()
                 
-                for time, mu, std, cov in zip(time_list, mu_list, std_list, cov_list):
+    #             for time, mu, std, cov in zip(time_list, mu_list, std_list, cov_list):
                     
-                    # Get a rescaler to satisfy the matrix sampler
-                    var_rescaler = StandardScaler()
-                    var_rescaler.fit(mu[:, None])
+    #                 # Get a rescaler to satisfy the matrix sampler
+    #                 var_rescaler = StandardScaler()
+    #                 var_rescaler.fit(mu[:, None])
                     
-                    # Columnize the mean
-                    mu_scaled = var_rescaler.transform(mu[:, None])
-                    mu_for_sample = tf.linalg.adjoint(mu_scaled)
+    #                 # Columnize the mean
+    #                 mu_scaled = var_rescaler.transform(mu[:, None])
+    #                 mu_for_sample = tf.linalg.adjoint(mu_scaled)
                     
-                    # Columnize the standard deviation
-                    sigma_scaled = std[:, None]/var_rescaler.scale_
+    #                 # Columnize the standard deviation
+    #                 sigma_scaled = std[:, None]/var_rescaler.scale_
                     
-                    # Get randomly sampled mean + standard deviation (as backup)
-                    samples_rng = [rng.normal(loc = mu_scaled, scale = sigma_scaled) 
-                                   for _ in range(num_samples)]
-                    samples_rng = np.array(samples_rng).squeeze()
+    #                 # Get randomly sampled mean + standard deviation (as backup)
+    #                 samples_rng = [rng.normal(loc = mu_scaled, scale = sigma_scaled) 
+    #                                for _ in range(num_samples)]
+    #                 samples_rng = np.array(samples_rng).squeeze()
                     
-                    # "Columnize" the covariance matrix
-                    cov_scaled = cov / var_rescaler.scale_
-                    cov_for_sample = cov_scaled[None, :, :]
+    #                 # "Columnize" the covariance matrix
+    #                 cov_scaled = cov / var_rescaler.scale_
+    #                 cov_for_sample = cov_scaled[None, :, :]
                     
-                    # Get samples
-                    samples_cov = gpflow.conditionals.util.sample_mvn(
-                        mu_for_sample, cov_for_sample, True, num_samples=num_samples)
-                    samples_cov = samples_cov.numpy().squeeze()
+    #                 # Get samples
+    #                 samples_cov = gpflow.conditionals.util.sample_mvn(
+    #                     mu_for_sample, cov_for_sample, True, num_samples=num_samples)
+    #                 samples_cov = samples_cov.numpy().squeeze()
                     
-                    # Each successive chunk will overwrite the previous overlapping bit
-                    # Since we've ensured continuity, this *seems* to be okay
-                    for i, (sample_cov, sample_rng) in enumerate(zip(samples_cov, samples_rng)):
+    #                 # Each successive chunk will overwrite the previous overlapping bit
+    #                 # Since we've ensured continuity, this *seems* to be okay
+    #                 for i, (sample_cov, sample_rng) in enumerate(zip(samples_cov, samples_rng)):
                         
-                        sample_cov_unscaled = var_rescaler.inverse_transform(sample_cov[:, None])
-                        sample_rng_unscaled = var_rescaler.inverse_transform(sample_rng[:, None])
+    #                     sample_cov_unscaled = var_rescaler.inverse_transform(sample_cov[:, None])
+    #                     sample_rng_unscaled = var_rescaler.inverse_transform(sample_rng[:, None])
                         
-                        # Check if the Cholesky decomposition failed (all NaN?)
-                        if np.isnan(sample_cov).any() == False:
+    #                     # Check if the Cholesky decomposition failed (all NaN?)
+    #                     if np.isnan(sample_cov).any() == False:
                             
-                            # If not, add the sample
-                            backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_cov_unscaled.flatten()
-                            backgroundSamples[i].loc[time, (source, var+'_sig')] = 0
+    #                         # If not, add the sample
+    #                         backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_cov_unscaled.flatten()
+    #                         backgroundSamples[i].loc[time, (source, var+'_sig')] = 0
                             
-                        else: 
+    #                     else: 
                             
-                            backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_rng_unscaled.flatten()
-                            # Sigma remains unchanged for this case
+    #                         backgroundSamples[i].loc[time, (source, var+'_mu')] = sample_rng_unscaled.flatten()
+    #                         # Sigma remains unchanged for this case
                     
-        self.backgroundSamples = backgroundSamples
+    #     self.backgroundSamples = backgroundSamples
   
-        return
+    #     return
         
     def generate_boundaryDistributions(self, constant_sig=0):
         from tqdm import tqdm
@@ -1080,7 +1386,8 @@ class multihuxt_inputs:
         # methodOptions = ['forward', 'back', 'both']
         methodOptions = ['both']
         
-        boundaryDistributions_dict = {}
+        boundaryDistributions_d = {}
+        boundarySamples_d = {}
         for source in self.boundarySources:
         
             # Format the insitu df (backgroundDistribution) as HUXt expects it
@@ -1128,13 +1435,16 @@ class multihuxt_inputs:
             # Get the left edges of longitude bins
             lons = np.linspace(0, 360, vcarr_mu.shape[0]+1)[:-1]
             
-            boundaryDistributions_dict[source] = {'t_grid': t,
-                                                  'lon_grid': lons, 
-                                                  'U_mu_grid': vcarr_mu,
-                                                  'U_sig_grid': vcarr_sig,
-                                                  'B_grid': bcarr}
+            boundaryDistributions_d[source] = {'t_grid': t,
+                                               'lon_grid': lons, 
+                                               'U_mu_grid': vcarr_mu,
+                                               'U_sig_grid': vcarr_sig,
+                                               'B_grid': bcarr}
+            
+            # !!!! For completeness, add boundarySamples here
+            boundarySamples_d[source] = []
         
-        self.boundaryDistributions = boundaryDistributions_dict
+        self.boundaryDistributions = boundaryDistributions_d
         
         # # =============================================================================
         # # Visualization 
@@ -1207,7 +1517,9 @@ class multihuxt_inputs:
         
         return
         
-    def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d):
+    def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d,
+                                      cluster_distance_limit=0.005,
+                                      max_chunk_length=2048):
         import gpflow
         import tensorflow as tf
         from sklearn.preprocessing import StandardScaler, MinMaxScaler, FunctionTransformer
@@ -1217,8 +1529,8 @@ class multihuxt_inputs:
         import multiprocessing as mp
         from joblib import Parallel, delayed
         
-        mean_relative_error = 0.001
-        max_chunk_length = 1024
+        # cluster_distance_limit = 0.001
+        # max_chunk_length = 1024
         
         # Get dimensions from OMNI boundary distribution, which *must* exist
         nLat = len(lat_for3d)
@@ -1297,18 +1609,21 @@ class multihuxt_inputs:
         # =============================================================================
         #         # Define kernel for each dimension separately, then altogether
         # =============================================================================
-        lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0])
+        lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0], lengthscales=0.1)
         
-        lon_kernel = gpflow.kernels.SquaredExponential(active_dims=[1]) + \
-                     gpflow.kernels.SquaredExponential(active_dims=[1]) * \
-                     gpflow.kernels.Periodic(gpflow.kernels.SquaredExponential(active_dims=[1]), 
-                                             period=gpflow.Parameter(1, trainable=False))
+        period_gp = gpflow.Parameter(1, trainable=False)
+        base_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=0.1)
+        amplitude_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=0.1)
+        period_kernel = gpflow.kernels.Periodic(
+            gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
+            period=period_gp)
+        lon_kernel = base_kernel + amplitude_kernel * period_kernel
                      
-        mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2])
+        mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2], lengthscales=0.1)
         
         all_kernel = gpflow.kernels.RationalQuadratic()
         kernel_mu = (lat_kernel + lon_kernel + mjd_kernel + 
-                     lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
+                     # lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
                      all_kernel)
         
         kernel_sigma = copy.deepcopy(kernel_mu)
@@ -1325,19 +1640,27 @@ class multihuxt_inputs:
         
         # Test values of n_clusters varying from clusters of size 5 to 40
         n_points = len(Y_mu)
-        n_clusters_test = (n_points / np.arange(2, 100+5, 5)).astype(int)
+        n_clusters_test = (n_points / np.logspace(np.log(2), 2, 20)).astype(int)
         
-        inertia = []
-        for n_clusters in n_clusters_test:
-            kmeans_mu = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
-            inertia.append(kmeans_mu.inertia_)
+        # inertia = []
+        distances_90p = []
+        for n_clusters in tqdm.tqdm(n_clusters_test, desc='Optimizing Clustering for GP'):
+            kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
+            # inertia.append(kmeans.inertia_)
+            kmeans_distances = []
+            for i in range(kmeans.n_clusters):
+                diff = XY_mu[kmeans.labels_==i,:] - kmeans.cluster_centers_[i]
+                _kmeans_distances = np.linalg.norm(diff, axis=1)
+                kmeans_distances.extend(_kmeans_distances)
+            distances_90p.append(np.percentile(kmeans_distances, 90))
         
         # Find the optimized number of clusters to meet our target rel. error
-        average_inertia = np.array(inertia)/n_points
-        n_clusters_optimized = np.interp(max_relative_error, average_inertia, n_clusters_test).astype(int)
+        # average_inertia = np.array(inertia)/n_points
+        n_clusters_optimized = np.interp(cluster_distance_limit, distances_90p, n_clusters_test).astype(int)
+        
+        # breakpoint()
         
         # Cluster data, then create chunks of clusters for optimization
-        
         kmeans_mu = KMeans(n_clusters=n_clusters_optimized,
                            random_state=0,
                            n_init="auto").fit(XY_mu)
@@ -1359,9 +1682,9 @@ class multihuxt_inputs:
         Xc_sigma_chunks = [chunk[:,0:3] for chunk in XYc_sigma_chunks]
         Yc_sigma_chunks = [chunk[:,3][:,None] for chunk in XYc_sigma_chunks]
         
-        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, mean_relative_error*3)
+        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, cluster_distance_limit)
         
-        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, mean_relative_error*3)
+        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, cluster_distance_limit)
 
         # =============================================================================
         # Predict values for the full grid...     
@@ -1379,7 +1702,7 @@ class multihuxt_inputs:
         print("Beginning Parallel Assignment")
         t0 = time.time()
         nCores = int(0.75 * mp.cpu_count()) 
-        chunksize = 5000
+        chunksize = 4096
         X3d_chunks = [X3d[pos:pos + chunksize] for pos in range(0, len(X3d), chunksize)]
         
         def process(model, X3d_chunk):
@@ -1394,11 +1717,6 @@ class multihuxt_inputs:
             # return Ymumu, Ymusigma, Ysigmamu, Ysigmasigma
             
             return Ymu_chunk, tf.sqrt(Ysigma2_chunk)
-        
-        # with warnings.catch_warnings():
-        #     warnings.simplefilter("ignore", UserWarning)
-        # import warnings
-        # warnings.filterwarnings('ignore') 
         
         mu_generator = Parallel(return_as='generator', n_jobs=nCores)(
             delayed(process)(model_mu, X3d_chunk) 
@@ -1418,14 +1736,12 @@ class multihuxt_inputs:
         Ysigma = np.concatenate([elem[0] for elem in Ysigma_chunklist], axis=0)
         Ysigmasigma = np.concatenate([elem[1] for elem in Ysigma_chunklist], axis=0)
         
-        # Ymumu = np.concatenate([elem[0] for elem in Y_chunklist], axis=0)
-        # Ymusigma = np.concatenate([elem[1] for elem in Y_chunklist], axis=0)
-        # Ysigmamu = np.concatenate([elem[2] for elem in Y_chunklist], axis=0)
-        # Ysigmasigma = np.concatenate([elem[3] for elem in Y_chunklist], axis=0)
-            
+        # !!!! Add individual samples 
+        
+        
         U_mu = val_mu_scaler.inverse_transform(Ymu)
-        # U_sigma = np.sqrt(val_sigma_scaler.inverse_transform(Ysigma)**2 + (val_mu_scaler.scale_ * Ymusigma)**2)
-        U_sigma = val_sigma_scaler.inverse_transform(Ysigma)
+        U_sigma = np.sqrt(val_sigma_scaler.inverse_transform(Ysigma)**2 + (val_mu_scaler.scale_ * Ymusigma)**2)
+        # U_sigma = val_sigma_scaler.inverse_transform(Ysigma)
         
         U_mu_3d = U_mu.reshape(nLat, nLon, nMjd)
         U_sigma_3d = U_sigma.reshape(nLat, nLon, nMjd)
@@ -1491,7 +1807,7 @@ class multihuxt_inputs:
         # Get the HGI latitude of the target at times matching the boundary grid
         target_lats = np.interp(self.boundaryDistributions3D['t_grid'],
                                 self.availableBackgroundData['mjd'],
-                                self.availableBackgroundData[(at, 'lat_HGI')])
+                                self.ephemeris[at].lat_c.to(u.deg).value)
         
         # Construct a 2D boundary 
         U_mu_2d = np.zeros(shape3D[1:])
@@ -1914,7 +2230,7 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, inne
     
     # Reformat for HUXt inputs expectation
     insitu_df['BX_GSE'] =  -insitu_df['BR']
-    insitu_df['V'] = insitu_df['U_mu']
+    insitu_df['V'] = insitu_df['U']
     insitu_df['datetime'] = insitu_df.index
     insitu_df = insitu_df.reset_index()
     
@@ -1931,7 +2247,7 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, inne
                                                      innerbound)
     return vcarr_inner
 
-
+# %%
 class GPFlowEnsemble:
     def __init__(self, kernel, X_list, Y_list, noise_variance):
     
@@ -1958,9 +2274,13 @@ class GPFlowEnsemble:
         for i, (X, Y) in enumerate(zip(self.X_list, self.Y_list)):
             print("Optimizing GP model #{} with {} points".format(i+1, len(X)))
             t1 = time.time()
-    
+            
+            # Copy kernel so the model is freshly solved each loop
+            # kernel = copy.deepcopy(self.kernel)
+            kernel = self.kernel
+            
             model = gpflow.models.GPR((X, Y),
-                                      kernel=self.kernel,
+                                      kernel=kernel,
                                       noise_variance=self.noise_variance)
     
             opt = gpflow.optimizers.Scipy()
@@ -1979,14 +2299,14 @@ class GPFlowEnsemble:
         weights = self.calculate_weights(X_new)
         
         result_mu = np.full((len(X_new), 1), 0, dtype='float64')
-        result_sigma = np.full((len(X_new), 1), 0, dtype='float64')
+        result_sigma2 = np.full((len(X_new), 1), 0, dtype='float64')
         for w, model in zip(weights, self.model_list):
-            f_mu, f_sigma = model.predict_f(X_new)
+            f_mu, f_sigma2 = model.predict_f(X_new)
             
             result_mu += w[:,None] * f_mu.numpy()
-            result_sigma += w[:,None] * f_sigma.numpy()
+            result_sigma2 += w[:,None] * f_sigma2.numpy()
             
-        return result_mu, result_sigma
+        return result_mu, result_sigma2
     
     def predict_f_samples(self, X_new, num_samples=1):
         
@@ -1994,24 +2314,78 @@ class GPFlowEnsemble:
         
         result = np.full((num_samples, len(X_new), 1), 0, dtype='float64')
         for w, model in zip(weights, self.model_list):
-            f = model.predict_f_samples(X_new, num_samples)
+            f_samples = model.predict_f_samples(X_new, num_samples)
             
-            result += np.tile(w[:,None], (num_samples, 1, 1)) * f.numpy()
+            result += np.tile(w[:,None], (num_samples, 1, 1)) * f_samples.numpy()
         
         return result
     
+    def predict_y(self, X_new):
+        
+        weights = self.calculate_weights(X_new)
+        
+        result_mu = np.full((len(X_new), 1), 0, dtype='float64')
+        result_sigma2 = np.full((len(X_new), 1), 0, dtype='float64')
+        for w, model in zip(weights, self.model_list):
+            y_mu, y_sigma2 = model.predict_y(X_new)
+            
+            result_mu += w[:,None] * y_mu.numpy()
+            result_sigma2 += w[:,None] * y_sigma2.numpy()
+            
+        return result_mu, result_sigma2
+    
+    # def predict_y_samples(self, X_new, num_samples=1):
+        
+    #     weights = self.calculate_weights(X_new)
+        
+    #     result = np.full((num_samples, len(X_new), 1), 0, dtype='float64')
+    #     for w, model in zip(weights, self.model_list):
+    #         f_samples = model.predict_f_samples(X_new, num_samples)
+    #         y_samples = model.likelihood.conditional_sample(f_samples, sample_shape=f_samples.shape)
+            
+    #         result += np.tile(w[:,None], (num_samples, 1, 1)) * y_samples.numpy()
+        
+    #     return result
+    
     def calculate_weights(self, X_new):
         import scipy
+        from scipy.spatial.distance import cdist
         
-        X_centers = [np.mean(X, axis=0) for X in self.X_list]
+        # X_centers = [np.mean(X, axis=0) for X in self.X_list]
         
-        # Distances are n_chunks by n_X_new
-        distances = [np.linalg.norm(X_new - X_center, axis=1) for X_center in X_centers]
-        distances = np.stack(distances) 
+        # # Distances are n_chunks by n_X_new
+        # distances = [np.linalg.norm(X_new - X_center, axis=1) for X_center in X_centers]
+        # distances = np.stack(distances) 
         
-        weights = scipy.special.softmax(-distances, axis=0)
+        # weights = scipy.special.softmax(-distances, axis=0)
+        
+        min_distances = []
+        for model in self.model_list:
+            # Get only the X dimensions of the model data
+            data = model.data[0]
+            
+            dist_matrix = cdist(data, X_new)
+            min_dists = np.min(dist_matrix, axis=0)
+            
+            min_distances.append(min_dists)
+            
+        min_distances = np.array(min_distances)
+        
+        # Normalize min_distances to the distance expected after 
+        norm_min_distances = min_distances / (1/len(self.X_list))
+        norm_min_distances[norm_min_distances > 1] = 1
+        
+        weights = scipy.special.softmax(20*(1-norm_min_distances), axis=0)
+        
+        # breakpoint()
+        
         
         return weights
+    
+    def print_summary(self):
+        import gpflow
+        for model in self.model_list:
+            gpflow.utilities.print_summary(model, 'simple')
 
 # def _process_sample(df_sample, method_sample):
 #     sf_sample_copy = df_sample.copy(deep=True)
