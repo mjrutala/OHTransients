@@ -1042,8 +1042,18 @@ class multihuxt_inputs:
             period_rescaled = carrington_period.to(u.day).value * mjd_scaler.scale_[0]
             period_gp = gpflow.Parameter(period_rescaled, trainable=False)
             
-            base_kernel = gpflow.kernels.RationalQuadratic(lengthscales=0.1)
-            amplitude_kernel = gpflow.kernels.RationalQuadratic(lengthscales=0.1)
+            import tensorflow_probability  as     tfp
+            
+            # Only predict 1 Carrington Rotation forward
+            min_x = 0
+            mid_x = period_rescaled / 2
+            max_x = period_rescaled
+            
+            lengthscale_gp = gpflow.Parameter(mid_x, 
+                transform = tfp.bijectors.SoftClip(min_x, max_x))
+            
+            base_kernel = gpflow.kernels.RationalQuadratic(lengthscales = lengthscale_gp)
+            amplitude_kernel = gpflow.kernels.RationalQuadratic(lengthscales = lengthscale_gp)
             period_kernel = gpflow.kernels.Periodic(
                 gpflow.kernels.SquaredExponential(lengthscales=period_gp),
                 period=period_gp)
@@ -2276,8 +2286,8 @@ class GPFlowEnsemble:
             t1 = time.time()
             
             # Copy kernel so the model is freshly solved each loop
-            # kernel = copy.deepcopy(self.kernel)
-            kernel = self.kernel
+            kernel = copy.deepcopy(self.kernel)
+            # kernel = self.kernel
             
             model = gpflow.models.GPR((X, Y),
                                       kernel=kernel,
@@ -2375,7 +2385,7 @@ class GPFlowEnsemble:
         norm_min_distances = min_distances / (1/len(self.X_list))
         norm_min_distances[norm_min_distances > 1] = 1
         
-        weights = scipy.special.softmax(20*(1-norm_min_distances), axis=0)
+        weights = scipy.special.softmax(100*(1-norm_min_distances), axis=0)
         
         # breakpoint()
         
