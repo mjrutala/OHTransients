@@ -35,6 +35,7 @@ import huxt as H
 import huxt_analysis as HA
 import huxt_inputs as Hin
 import huxt_atObserver as hao
+import mhuxt_readers as mr
 # from scipy import ndimage
 # from scipy import stats
 # from sklearn.metrics import root_mean_squared_error as rmse
@@ -47,73 +48,9 @@ try:
     plt.style.use('/Users/mrutala/code/python/mjr.mplstyle')
 except:
     pass
-
-def lookup_omni(starttime, stoptime):
-    """
-    A function to grab and process the most up-to-date OMNI data from 
-    COHOWeb directly
     
-    Args:
-        starttime : datetime for start of requested interval
-        endtime : datetime for start of requested interval
-
-    Returns:
-        omni: Dataframe of the OMNI timeseries
-
-    """
-    # trange = attrs.Time(starttime, endtime)
-    # dataset = attrs.cdaweb.Dataset('OMNI_COHO1HR_MERGED_MAG_PLASMA')
-    # result = Fido.search(trange, dataset)
-    # downloaded_files = Fido.fetch(result, path='../Data/OMNI/')
-    
-    # omni = TimeSeries(downloaded_files, concatenate=True).to_dataframe()
-    # omni = omni.rename(columns = {'ABS_B': 'B',
-    #                               'V': 'U'})
-    # # Set invalid data points to NaN
-    # id_bad = omni['U'] == 9999.0
-    # omni.loc[id_bad, 'U'] = np.NaN
-
-    
-    # Get the relevant URLs
-    skeleton_url = 'https://spdf.gsfc.nasa.gov/pub/data/omni/low_res_omni/omni_m{YYYY:4.0f}.dat'
-    years_covered = np.arange(starttime.year, stoptime.year+1, 1)
-    all_urls = [skeleton_url.format(YYYY=year) for year in years_covered]
-    
-    # Read each OMNI file, concatenate, and set NaNs 
-    null_values = {'year': None, 'doy': None, 'hour': None,
-                   'lat_hgi': 9999.9, 'lon_hgi': 9999.9, 
-                   'BR': 999.9, 'BT': 999.9, 'BN': 999.9, 'B': 999.9, 
-                   'U': 9999., 'U_theta': 999.9, 'U_phi': 999.9,
-                   'n': 999.9, 'T': 9999999.}
-    df_list = []
-    for url in all_urls:
-        df = pd.read_csv(url, header=0, sep='\s+', names=null_values.keys())
-        df_list.append(df)
-    df = pd.concat(df_list, axis='index') 
-    df = df.reset_index(drop=True).sort_index()
-    for col, null_val in null_values.items():
-        null_index = df[col] == null_val
-        df.loc[null_index, col] = np.nan
-    
-    # Add datetime, MJD
-    parse_dt = datetime.datetime.strptime
-    date_cols = ['year', 'doy', 'hour']
-    str_fmt   = '{:04.0f}-{:03.0f} {:02.0f}'
-    dt_fmt    = '%Y-%j %H'
-    df['dt'] = [parse_dt(str_fmt.format(*row[date_cols]), dt_fmt) 
-                      for _, row in df.iterrows()]
-    df['mjd'] = Time(df['dt']).mjd
-
-    # create a BX_GSE field that is expected by some HUXt fucntions
-    df['BX_GSE'] = -df['BR']
-    
-    # Limit the dataframe to the requested dates
-    omni = df.query('@starttime <= dt < @stoptime')
-    # omni = omni.rename(columns={'dt': 'datetime'})
-    omni = omni.reset_index(drop=True)
-    
-    return omni
-
+# %%
+import tensorflow_probability  as     tfp
 class multihuxt_inputs:
     def __init__(self, start, stop, rmax=1, latmax=10):
         self.start = start
@@ -140,7 +77,7 @@ class multihuxt_inputs:
         self.cmeDistribution = pd.DataFrame(columns = cols)
         
         
-        self.path_cohodata = '/Users/mrutala/projects/OHTransients/data/'
+        
         return
         
     @property
@@ -205,7 +142,19 @@ class multihuxt_inputs:
     def copy(self):
         return copy.deepcopy(self)
     
-    def _identify_source(self, source):
+    # def _identify_source(self, source):  
+    #     source_aliases = {'omni': ['omni'],
+    #                       'parker solar probe': ['parkersolarprobe', 'psp', 'parker solar probe'],
+    #                       'stereo a': ['stereoa', 'stereo a', 'sta'],
+    #                       'stereo b': ['stereob', 'stereo b', 'stb'],
+    #                       # 'helios1': ['helios1', 'helios 1'],
+    #                       # 'helios2': ['helios2', 'helios 2'],
+    #                       'ulysses': ['ulysses', 'uy'],
+    #                       # 'maven': ['maven'],
+    #                       'voyager 1': ['voyager1', 'voyager 1'],
+    #                       'voyager 2': ['voyager2', 'voyager 2']}
+        
+    def get_availableBackgroundData(self, sources=None):
         
         source_aliases = {'omni': ['omni'],
                           'parker solar probe': ['parkersolarprobe', 'psp', 'parker solar probe'],
@@ -218,20 +167,7 @@ class multihuxt_inputs:
                           'voyager 1': ['voyager1', 'voyager 1'],
                           'voyager 2': ['voyager2', 'voyager 2']}
         
-    def get_availableBackgroundData(self, sources=None):
-        
-        source_functions = {'omni': self.get_omni,
-                            'parker solar probe': self.get_parkersolarprobe,
-                            'stereo a': self.get_stereoa,
-                            'stereo b': self.get_stereob,
-                            # 'helios1': self.get_helios1,
-                            # 'helios2': self.get_helios2,
-                            'ulysses': self.get_ulysses,
-                            # 'maven': self.get_maven,
-                            'voyager 1': self.get_voyager1,
-                            'voyager 2': self.get_voyager2}
-        
-        all_sources = list(source_functions.keys())
+        all_sources = list(source_aliases.keys())
         
         # Check if sources are specified; if not, use them all
         if sources is None:
@@ -246,7 +182,7 @@ class multihuxt_inputs:
         for source in sources:
             print(source)
             print('----------------------------')
-            data_df = source_functions[source]()
+            data_df = mr.SolarWindData(source, self.simstart, self.simstop).data
             if data_df is not None: 
                 available_sources.append(source)
                 available_data_dict[source] = data_df
@@ -258,208 +194,6 @@ class multihuxt_inputs:
         self.availableBackgroundData = available_data_df
         
         return
-    
-    def _fetchFromCOHOWeb(self, source, fetch_datasetID):
-        # Mute warnings
-        import warnings
-        warnings.filterwarnings("ignore")
-                
-        # Simulation time range in Fido format
-        timerange = attrs.Time(self.simstarttime, self.simstoptime)
-        
-        # 
-        try:
-            dataset = attrs.cdaweb.Dataset(fetch_datasetID)
-            result = Fido.search(timerange, dataset)
-            downloaded_files = Fido.fetch(result, path = self.path_cohodata + source.upper() + '/{file}')
-        except:
-            breakpoint()
-        
-        # If there's any files to download, download them and get the dataframe
-        if len(downloaded_files) > 0:
-            # Combine the data for this source into one df
-            df = TimeSeries(downloaded_files, concatenate=True).to_dataframe()
-           
-            # Truncate to the appropriate start/stop time
-            df = df.query("@self.simstart <= index < @self.simstop")
-            
-        else:
-            df = None
-        
-        return df
-    
-    def get_omni(self):
-        
-        # Source and Dataset names
-        source = 'omni'
-        fetch_datasetID = 'OMNI_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'V': 'U',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'rad_HGI': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns & add distance
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            # Add the radial distance
-            data_df['rad_HGI'] = 1.0
-            data_df = data_df[column_map.values()]
-        
-        return data_df
-    
-    def get_stereoa(self):
-        # Source and Dataset names
-        source = 'stereo a'
-        fetch_datasetID = 'STA_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'plasmaSpeed': 'U',
-                      'lat': 'Uel',
-                      'lon': 'Uaz',
-                      'radialDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            data_df = data_df[column_map.values()]
-        
-        return data_df
-        
-    def get_stereob(self):
-        # Source and Dataset names
-        source = 'stereo b'
-        fetch_datasetID = 'STB_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'plasmaSpeed': 'U',
-                      'lat': 'Uel',
-                      'lon': 'Uaz',
-                      'radialDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            data_df = data_df[column_map.values()]
-        
-        return data_df    
-    
-    def get_voyager1(self):
-        
-        # Source and Dataset names
-        source = 'voyager 1'
-        fetch_datasetID = 'VOYAGER1_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'V': 'U',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'heliocentricDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            data_df = data_df[column_map.values()]
-        
-        return data_df
-    
-    def get_voyager2(self):
-        
-        # Source and Dataset names
-        source = 'voyager 2'
-        fetch_datasetID = 'VOYAGER2_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'V': 'V',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'heliocentricDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            data_df = data_df[column_map.values()]
-        
-        return data_df
-    
-    def get_ulysses(self):
-        # Source and Dataset names
-        source = 'ulysses'
-        fetch_datasetID = 'UY_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'plasmaFlowSpeed': 'U',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'heliocentricDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            data_df = data_df[column_map.values()]
-        
-        return data_df    
-    
-    def get_parkersolarprobe(self):
-        # Source and Dataset names
-        source = 'parker solar probe'
-        fetch_datasetID = 'PSP_COHO1HR_MERGED_MAG_PLASMA'
-        
-        # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'ProtonSpeed': 'U',
-                      'flow_theta': 'Uel',
-                      'flow_lon': 'Uaz',
-                      'radialDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
-        
-        # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID)
-        
-        # If data exists, rename columns
-        if data_df is not None:
-            data_df.rename(columns = column_map, inplace=True)
-            data_df = data_df[column_map.values()]
-        
-        return data_df    
     
     def filter_availableBackgroundData(self):
         
@@ -1042,7 +776,7 @@ class multihuxt_inputs:
             period_rescaled = carrington_period.to(u.day).value * mjd_scaler.scale_[0]
             period_gp = gpflow.Parameter(period_rescaled, trainable=False)
             
-            import tensorflow_probability  as     tfp
+            
             
             # Only predict 1 Carrington Rotation forward
             min_x = 0
@@ -1619,17 +1353,38 @@ class multihuxt_inputs:
         # =============================================================================
         #         # Define kernel for each dimension separately, then altogether
         # =============================================================================
-        lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0], lengthscales=0.1)
+        # breakpoint()
+        
+        lat_scale_min = 0 * lat_scaler.scale_
+        lat_scale_mid = 1 * lat_scaler.scale_
+        lat_scale_max = 5 * lat_scaler.scale_
+        lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
+           transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
+        
+        mjd_scale_min = 0.0
+        mjd_scale_mid = 25.38 * mjd_scaler.scale_
+        mjd_scale_max = 3 * 25.38 * mjd_scaler.scale_
+        if mjd_scale_max > 1: mjd_scale_max = 1
+        mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
+           transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
+        
+        lon_scale_min = np.float64(0.0)
+        lon_scale_mid = np.float64(0.5)
+        lon_scale_max = np.float64(1.0)
+        lon_lengthscale = gpflow.Parameter(lon_scale_mid, 
+           transform = tfp.bijectors.SoftClip(lon_scale_min, lon_scale_max))
+        
+        lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0], lengthscales=lat_lengthscale)
         
         period_gp = gpflow.Parameter(1, trainable=False)
-        base_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=0.1)
-        amplitude_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=0.1)
+        base_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=lon_lengthscale)
+        amplitude_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=lon_lengthscale)
         period_kernel = gpflow.kernels.Periodic(
             gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
             period=period_gp)
         lon_kernel = base_kernel + amplitude_kernel * period_kernel
                      
-        mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2], lengthscales=0.1)
+        mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2], lengthscales=mjd_lengthscale)
         
         all_kernel = gpflow.kernels.RationalQuadratic()
         kernel_mu = (lat_kernel + lon_kernel + mjd_kernel + 
@@ -1858,13 +1613,13 @@ class multihuxt_inputs:
     def generate_cmeDistribution(self, search=True):
         
         # 
-        t_sig_init = 36000 # seconds
-        lon_sig_init = 15 # degrees
-        lat_sig_init = 15 # degrees
-        width_sig_init = 30 # degrees
+        t_sig_init = 3*3600 # seconds
+        lon_sig_init = 10 # degrees
+        lat_sig_init = 10 # degrees
+        width_sig_init = 10 # degrees
         thick_mu_init = 4 # solar radii
         thick_sig_init = 1 # solar radii
-        speed_sig_init = 400 # km/s
+        speed_sig_init = 200 # km/s
         
         # Get the CMEs
         if search == True:
