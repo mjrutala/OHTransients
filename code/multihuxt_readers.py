@@ -341,11 +341,11 @@ class SolarWindData:
         source = 'omni'
         fetch_datasetID = 'OMNI_COHO1HR_MERGED_MAG_PLASMA'
         
+        
         # Which columns to keep, and what to call them
         column_map = {'V': 'U',
                       'ABS_B': 'B',
                       'BR': 'Br'}
-        
         # Get the data
         data_df = self._fetch(source, fetch_datasetID, start, stop)
         
@@ -361,11 +361,6 @@ class SolarWindData:
     def stereoa(self, start, stop):
         # Source and Dataset names
         source = 'stereo a'
-        # datasetID_list = ['STA_COHO1HR_MERGED_MAG_PLASMA',
-        #                   'STA_L2_PLA_1DMAX_1MIN']
-        # magID_list = ['STA_L1_MAG_RTN']
-        # plaID_list = ['STA_L2_PLA_1DMAX_1HR',
-        #               'STA_L2_PLA_1DMAX_1MIN']
         
         ordered_ID_list = [['STA_COHO1HR_MERGED_MAG_PLASMA'],
                            ['STA_L2_PLA_1DMAX_1MIN', 'STA_L1_MAG_RTN']]
@@ -378,7 +373,6 @@ class SolarWindData:
             'STA_L1_MAG_RTN':                   {'BFIELD_3': 'B',
                                                  'BFIELD_0': 'Br'}
                         }
-        
         # Descend the data options until we have all the data
         # As there are some gaps which persist across data products,
         # we don't want to simply check for 'full' coverage
@@ -395,7 +389,7 @@ class SolarWindData:
             
             
             combined_df = pd.concat(partial_dfs, axis='columns')
-
+            
             if ~combined_df.iloc[0].isna().any() or ~combined_df.iloc[-1].isna().any():
                 break
         
