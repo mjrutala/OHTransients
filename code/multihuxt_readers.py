@@ -125,33 +125,43 @@ class SolarWindData:
         self.resolution = '1h'
         self.variables = ['U', 'B', 'Br']
         
-        self.path_cohodata = Path('/Users/mrutala/projects/OHTransients/data/')
-        filename = (source + ' coho 1hr.csv.zip').replace(' ', '_')
-        self.file_cohodata = self.path_cohodata / (filename)
+        self.path = Path('/Users/mrutala/projects/OHTransients/data/')
+        filename = (source + ' 1hr.csv.zip').replace(' ', '_')
+        self.filepath = self.path / (filename)
         
-        # index = pd.date_range(start=start, end=stop, freq=self.resolution)
-        # self.data = pd.DataFrame(index = index, columns = ['U', 'B', 'Br'])
+        # Generate an empty dataframe to fill with data
+        index = pd.date_range(start=start, end=stop, freq=self.resolution)[:-1]
+        self.data = pd.DataFrame(index = pd.DatetimeIndex(index, name='Epoch'), 
+                                 columns = self.variables,
+                                 dtype=np.float64)
         
-        self.data = self.fetch_data()
         
-    def fetch_data(self):
+        self.search()
+        
+    @property
+    def starttime(self):
+        return Time(self.start)
+    
+    @property
+    def stoptime(self):
+        return Time(self.stop)
+            
+    def search(self):
+        
+        # Get the correct reader function
         fn = self.identifyDatasetLookupFunction()
         
-        # if file_cohodata does not exist, download all data
-        # if file_cohodata does exist, check the coverage
+        # if filepath does not exist, download all data
+        # if filepath does exist, check the coverage
         
-        if self.file_cohodata.exists():
-            # Generate list of indices (datetimes) that should exist
-            dts = np.arange(self.start, self.stop, datetime.timedelta(hours=1))
-            dt_index = pd.DatetimeIndex(dts)
-           
+        if self.filepath.exists():
             # Load the existing data
-            data_df = pd.read_csv(self.file_cohodata, index_col='Epoch')
+            data_df = pd.read_csv(self.filepath, index_col='Epoch')
             data_df.index = pd.DatetimeIndex(data_df.index)
             data_df.query("@self.start <= index < @self.stop", inplace=True)
             
             # Find datetimes missing from dt_index
-            missing_set = set(dt_index) - set(data_df.index)
+            missing_set = set(self.data.index) - set(data_df.index)
             if len(missing_set) > 0:
                 
                 missing_index = pd.DatetimeIndex(np.sort(list(missing_set)))
@@ -167,9 +177,10 @@ class SolarWindData:
                     partial_dfs.append(partial_df)
                     
                 data_df = pd.concat(partial_dfs, axis='index')
+                data_df.sort_index(inplace=True)
                 
-                # Save the new data
-                data_df.to_csv(self.file_cohodata, index=True, compression='zip')
+                # # Save the new data
+                # self.update_csv(data_df)
                 
             # if missing_set has 0 len, we already have what we need
             else:
@@ -177,20 +188,37 @@ class SolarWindData:
             
         else:
             data_df = fn(self.start, self.stop)
-            if data_df is not None:
-                data_df.to_csv(self.file_cohodata, index=True, compression='zip')
+            
+        # Assign this to self.data
+        for col in self.data.columns:
+            if col in data_df.columns:
+                self.data.loc[:,col] = pd.to_numeric(data_df.loc[:,col])
 
+        # Wrap up by updating/creating the csv
+        self.update_csv(self.data)
         
         return data_df
-
-    @property
-    def starttime(self):
-        return Time(self.start)
     
-    @property
-    def stoptime(self):
-        return Time(self.stop)
-        
+    def update_csv(self, df):
+        if self.filepath.exists():
+            # Read the existing df
+            existing_df = pd.read_csv(self.filepath, index_col='Epoch')
+            existing_df .index = pd.DatetimeIndex(existing_df.index)
+            
+            # Concatenate with the new one
+            combined_df = pd.concat([existing_df, df])
+            
+            # Ensure monotonic index
+            combined_df.sort_index(inplace=True)
+            combined_df = combined_df.loc[~combined_df.index.duplicated(keep='first'), :]
+            
+            # Save
+            combined_df.to_csv(self.filepath, index=True, compression='zip')
+            
+        else:
+            df.to_csv(self.filepath, index=True, compression='zip')
+
+
     def identify_source(self, input_source):
         
         source_aliases = {'omni': ['omni2'],
@@ -241,7 +269,7 @@ class SolarWindData:
         try:
             dataset = attrs.cdaweb.Dataset(datasetID)
             result = Fido.search(timerange, dataset)
-            downloaded_files = Fido.fetch(result, path = str(self.path_cohodata / source.upper()) + '/{file}')
+            downloaded_files = Fido.fetch(result, path = str(self.path / source.upper()) + '/{file}')
         except:
             breakpoint()
         
@@ -316,13 +344,13 @@ class SolarWindData:
         # Which columns to keep, and what to call them
         column_map = {'V': 'U',
                       'ABS_B': 'B',
-                      'BR': 'BR'}
+                      'BR': 'Br'}
         
         # Get the data
         data_df = self._fetch(source, fetch_datasetID, start, stop)
         
         # If data exists, rename columns & add distance
-        if data_df is not None:
+        if len(data_df.columns) > 0:
             data_df.rename(columns = column_map, inplace=True)
             # Add the radial distance
             data_df = data_df[column_map.values()]
@@ -347,8 +375,8 @@ class SolarWindData:
                                                  'BR': 'Br',
                                                  'plasmaSpeed': 'U'},
             'STA_L2_PLA_1DMAX_1MIN':            {'proton_bulk_speed': 'U'},
-            'STA_L1_MAG_RTN':                   {'BFIELD_0': 'Br', 
-                                                 'BFIELD_3': 'B'}
+            'STA_L1_MAG_RTN':                   {'BFIELD_3': 'B',
+                                                 'BFIELD_0': 'Br'}
                         }
         
         # Descend the data options until we have all the data
@@ -371,11 +399,10 @@ class SolarWindData:
             if ~combined_df.iloc[0].isna().any() or ~combined_df.iloc[-1].isna().any():
                 break
         
-        # # If data exists, rename columns
-        # if data_df is not None:
-        #     data_df.rename(columns = column_map, inplace=True)
-        #     data_df = data_df[column_map.values()]
-        
+        # If data exists, rename columns
+        if combined_df is not None:
+            combined_df.index.name = 'Epoch'
+
         return combined_df
         
     def stereob(self, start, stop):
@@ -384,21 +411,18 @@ class SolarWindData:
         fetch_datasetID = 'STB_COHO1HR_MERGED_MAG_PLASMA'
         
         # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'plasmaSpeed': 'U',
-                      'lat': 'Uel',
-                      'lon': 'Uaz',
-                      'radialDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
+        column_map = {'plasmaSpeed': 'U',
+                      'B': 'B',
+                      'BR': 'Br',}
         
         # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID, start, stop)
+        data_df = self._fetch(source, fetch_datasetID, start, stop)
         
         # If data exists, rename columns
-        if data_df is not None:
+        if len(data_df.columns) > 0:
             data_df.rename(columns = column_map, inplace=True)
             data_df = data_df[column_map.values()]
+            data_df.index.name = 'Epoch'
         
         return data_df    
     
@@ -409,21 +433,18 @@ class SolarWindData:
         fetch_datasetID = 'VOYAGER1_COHO1HR_MERGED_MAG_PLASMA'
         
         # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'V': 'U',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'heliocentricDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
+        column_map = {'V': 'U',
+                      'ABS_B': 'B',
+                      'BR': 'Br'}
         
         # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID, start, stop)
+        data_df = self._fetch(source, fetch_datasetID, start, stop)
         
         # If data exists, rename columns
-        if data_df is not None:
+        if len(data_df.columns) > 0:
             data_df.rename(columns = column_map, inplace=True)
             data_df = data_df[column_map.values()]
+            data_df.index.name = 'Epoch'
         
         return data_df
     
@@ -434,21 +455,18 @@ class SolarWindData:
         fetch_datasetID = 'VOYAGER2_COHO1HR_MERGED_MAG_PLASMA'
         
         # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'V': 'V',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'heliocentricDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
+        column_map = {'V': 'U',
+                      'ABS_B': 'B',
+                      'BR': 'Br',}
         
         # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID, start, stop)
+        data_df = self._fetch(source, fetch_datasetID, start, stop)
         
         # If data exists, rename columns
-        if data_df is not None:
+        if len(data_df.columns) > 0:
             data_df.rename(columns = column_map, inplace=True)
             data_df = data_df[column_map.values()]
+            data_df.index.name = 'Epoch'
         
         return data_df
     
@@ -458,21 +476,18 @@ class SolarWindData:
         fetch_datasetID = 'UY_COHO1HR_MERGED_MAG_PLASMA'
         
         # Which columns to keep, and what to call them
-        column_map = {'BR': 'BR',
-                      'plasmaFlowSpeed': 'U',
-                      'elevAngle': 'Uel',
-                      'azimuthAngle': 'Uaz',
-                      'heliocentricDistance': 'rad_HGI',
-                      'heliographicLatitude': 'lat_HGI',
-                      'heliographicLongitude': 'lon_HGI'}
+        column_map = {'plasmaFlowSpeed': 'U',
+                      'B': 'B',
+                      'BR': 'Br',}
         
         # Get the data
-        data_df = self._fetchFromCOHOWeb(source, fetch_datasetID, start, stop)
+        data_df = self._fetch(source, fetch_datasetID, start, stop)
         
         # If data exists, rename columns
-        if data_df is not None:
+        if len(data_df.columns) > 0:
             data_df.rename(columns = column_map, inplace=True)
             data_df = data_df[column_map.values()]
+            data_df.index.name = 'Epoch'
         
         return data_df    
     
@@ -490,7 +505,7 @@ class SolarWindData:
         data_df = self._fetch(source, fetch_datasetID, start, stop)
         
         # If data exists, rename columns
-        if data_df is not None:
+        if len(data_df.columns) > 0:
             data_df.rename(columns = column_map, inplace=True)
             data_df = data_df[column_map.values()]
             data_df.index.name = 'Epoch'
