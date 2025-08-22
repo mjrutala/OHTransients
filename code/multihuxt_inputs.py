@@ -35,7 +35,7 @@ import huxt as H
 import huxt_analysis as HA
 import huxt_inputs as Hin
 import huxt_atObserver as hao
-import mhuxt_readers as mr
+import multihuxt_readers as mr
 # from scipy import ndimage
 # from scipy import stats
 # from sklearn.metrics import root_mean_squared_error as rmse
@@ -274,6 +274,7 @@ class multihuxt_inputs:
             
             availableTransientData_list.append(icmes)
         
+        availableTransientData_list = [df for df in availableTransientData_list if not df.empty]
         availableTransientData_df = pd.concat(availableTransientData_list, axis='rows')
         availableTransientData_df.reset_index(inplace=True, drop=True)
         if len(availableTransientData_df) > 0:
@@ -379,7 +380,7 @@ class multihuxt_inputs:
         # More correct unit-slapping
         average_cluster_span *= u.hour
         
-        target_variables = ['U'] # , 'BR']
+        target_variables = ['U'] # , 'Br']
         
         n_data = len(self.availableBackgroundData)
         
@@ -397,10 +398,10 @@ class multihuxt_inputs:
             else:
                 indexICME = ICME_df[source]
             
-            # Where an ICME is present, set U, BR to NaN
+            # Where an ICME is present, set U, Br to NaN
             insitu_noICME = self.availableBackgroundData[source]
             insitu_noICME['mjd'] = self.availableBackgroundData['mjd']
-            insitu_noICME.loc[indexICME, ['U', 'BR']] = np.nan
+            insitu_noICME.loc[indexICME, ['U', 'Br']] = np.nan
             
             new_insitu_list = []
             covariance_list = []
@@ -603,10 +604,10 @@ class multihuxt_inputs:
             else:
                 indexICME = ICME_df[source]
             
-            # Where an ICME is present, set U, BR to NaN
+            # Where an ICME is present, set U, Br to NaN
             insitu_noICME = self.availableBackgroundData[source]
             insitu_noICME['mjd'] = self.availableBackgroundData['mjd']
-            insitu_noICME.loc[indexICME, ['U', 'BR']] = np.nan
+            insitu_noICME.loc[indexICME, ['U', 'Br']] = np.nan
             
             new_insitu_list = []
             covariance_list = []
@@ -1005,7 +1006,7 @@ class multihuxt_inputs:
         # Set up dictionaries 
         gp_variables = {k: {} for k in target_variables}
         
-        for target_var in target_variables: # ['U', 'BR']:
+        for target_var in target_variables: # ['U', 'Br']:
             
             new_insitu[target_var+'_mu'] = df[target_var].interpolate(limit_direction=None)
             new_insitu[target_var+'_sig'] = new_insitu[target_var+'_mu'].rolling('1d').std()
@@ -1136,7 +1137,7 @@ class multihuxt_inputs:
         
             # Format the insitu df (backgroundDistribution) as HUXt expects it
             insitu_df = self.backgroundDistributions[source].copy(deep=True)
-            insitu_df['BX_GSE'] =  -insitu_df['BR']
+            insitu_df['BX_GSE'] =  -insitu_df['Br']
             insitu_df['V'] = insitu_df['U_mu']
             insitu_df['datetime'] = insitu_df.index
             insitu_df = insitu_df.reset_index()
@@ -1155,7 +1156,7 @@ class multihuxt_inputs:
             
             func = _map_vBoundaryInwards
             funcGenerator = Parallel(return_as='generator', n_jobs=nCores)(
-                delayed(func)(self.simstart, self.simstop, source, df_sample, method_sample, self.innerbound)
+                delayed(func)(self.simstart, self.simstop, source, df_sample, method_sample, self.ephemeris[source], self.innerbound)
                 for df_sample, method_sample in zip(dfSamples, methodSamples))
             
             results = list(tqdm(funcGenerator, total=len(dfSamples)))
@@ -1909,6 +1910,9 @@ class multihuxt_inputs:
                                          cme_list = cme_list,
                                          r_min=self.innerbound)
             
+            # Do a bit of reformatting
+            future.drop(columns=['r', 'lon'], inplace=True)
+            future.rename(columns={'U': 'U', 'BX': 'Br'}, inplace=True)
             
             futureInterpolated = pd.DataFrame(index=self.availableBackgroundData.index,
                                               columns=future.columns)
@@ -1923,6 +1927,7 @@ class multihuxt_inputs:
             )
         
         ensemble = list(tqdm(futureGenerator, total=nSamples))
+        # !!!! ditch ephemeris info in these files
         
         print("{} HUXt forecasts completed in {}s".format(len(ensemble), time.time()-t0))
         
@@ -1951,7 +1956,7 @@ class multihuxt_inputs:
         
         return ensemble
     
-    def estimate(self, ensemble, weights): # in loop
+    def estimate(self, ensemble, weights, columns=None): # in loop
         """
         Return a weighted median metamodel
     
@@ -1970,6 +1975,9 @@ class multihuxt_inputs:
         metamodel = pd.DataFrame(index = ensemble[0].index)
         ensemble_columns = ensemble[0].columns
         
+        if columns is None:
+            columns = ['U', 'Br']
+        
         for col in ensemble_columns:
             for index in metamodel.index:
                 vals = [m.loc[index, col] for m in ensemble]
@@ -1980,7 +1988,7 @@ class multihuxt_inputs:
                 weighted_upper95 = vals[valsort_indx[np.searchsorted(cumsum_weights, 0.975 * cumsum_weights[-1])]]
                 weighted_lower95 = vals[valsort_indx[np.searchsorted(cumsum_weights, 0.025 * cumsum_weights[-1])]]
                 
-                if col in ['U', 'BX']:
+                if col in columns:
                     metamodel.loc[index, col+"_median"] = weighted_median
                     metamodel.loc[index, col+"_upper95"] = weighted_upper95
                     metamodel.loc[index, col+"_lower95"] = weighted_lower95
@@ -1991,10 +1999,10 @@ class multihuxt_inputs:
     
 
 # Define an inner function to be run in parallel
-def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, innerbound):
+def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, ephemeris, innerbound):
     
     # Reformat for HUXt inputs expectation
-    insitu_df['BX_GSE'] =  -insitu_df['BR']
+    insitu_df['BX_GSE'] =  -insitu_df['Br']
     insitu_df['V'] = insitu_df['U']
     insitu_df['datetime'] = insitu_df.index
     insitu_df = insitu_df.reset_index()
@@ -2007,8 +2015,9 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, inne
     # Map to 210 solar radii, then to the inner boundary for the model
     vcarr_inner = vcarr.copy()
     for i, _ in enumerate(t):
+        current_r = np.interp(t[i], ephemeris.time.mjd, ephemeris.r)
         vcarr_inner[:,i] = Hin.map_v_boundary_inwards(vcarr[:,i]*u.km/u.s,
-                                                     (insitu_df['rad_HGI'][i]*u.AU).to(u.solRad),
+                                                     current_r.to(u.solRad),
                                                      innerbound)
     return vcarr_inner
 
