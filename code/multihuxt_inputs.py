@@ -156,18 +156,8 @@ class multihuxt_inputs:
         
     def get_availableBackgroundData(self, sources=None):
         
-        source_aliases = {'omni': ['omni'],
-                          'parker solar probe': ['parkersolarprobe', 'psp', 'parker solar probe'],
-                          'stereo a': ['stereoa', 'stereo a', 'sta'],
-                          'stereo b': ['stereob', 'stereo b', 'stb'],
-                          # 'helios1': ['helios1', 'helios 1'],
-                          # 'helios2': ['helios2', 'helios 2'],
-                          'ulysses': ['ulysses', 'uy'],
-                          # 'maven': ['maven'],
-                          'voyager 1': ['voyager1', 'voyager 1'],
-                          'voyager 2': ['voyager2', 'voyager 2']}
-        
-        all_sources = list(source_aliases.keys())
+        all_sources = ['omni', 'parker solar probe', 'stereo a', 'stereo b',
+                       'ulysses', 'voyager 1', 'voyager 2']
         
         # Check if sources are specified; if not, use them all
         if sources is None:
@@ -183,7 +173,7 @@ class multihuxt_inputs:
             print(source)
             print('----------------------------')
             data_df = mr.SolarWindData(source, self.simstart, self.simstop).data
-            if data_df is not None: 
+            if not data_df.isna().all().all(): 
                 available_sources.append(source)
                 available_data_dict[source] = data_df
                 
@@ -292,8 +282,8 @@ class multihuxt_inputs:
         interp_buffer *= u.day
         
         # Get the insitu data + mjd at this source
-        insitu = self.availableBackgroundData[source]
-        insitu['mjd'] = self.availableBackgroundData['mjd']
+        insitu = self.availableBackgroundData[source].copy()
+        insitu.loc[:, 'mjd'] = self.availableBackgroundData.loc[:, 'mjd']
         
         # Interpolate over existing data gaps (NaNs), so they aren't caught as ICMEs
         insitu.interpolate(method='linear', axis='columns', limit_direction='both', inplace=True)
