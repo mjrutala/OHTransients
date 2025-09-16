@@ -341,22 +341,18 @@ class multihuxt_inputs:
                                          GP = False, extend = False,
                                          cluster_distance_limit = 0.001,
                                          max_chunk_length = 1024,
-                                         num_samples = 0):
+                                         num_samples = 0,):
         target_variables = ['U']
         
-        # Calculate the span from stop - start
-        span = (self.stop - self.start).total_seconds() * u.s
-        simspan = (self.simstop - self.simstart).total_seconds() * u.s
+        # # Calculate the span from stop - start
+        # span = (self.stop - self.start).total_seconds() * u.s
+        # simspan = (self.simstop - self.simstart).total_seconds() * u.s
         
-        n_data = len(self.availableBackgroundData)
+        # n_data = len(self.availableBackgroundData)
         
-        # ambient_solar_wind_d = {k: {v: {'mean': np.full([n_data, n_chunks], np.nan), 
-        #                                 'std': np.full([n_data, n_chunks], np.nan), 
-        #                                 'cov': np.full([n_data, n_data, n_chunks], np.nan)} 
-        #                             for v in target_variables} 
-        #                         for k in self.boundarySources}
-        
+        # summary holds summary statistics (mean, standard deviation)
         all_summary = {}
+        # samples holds individual samples drawn from the full covariance
         all_samples = {}
         
         for source in self.boundarySources:
@@ -368,12 +364,12 @@ class multihuxt_inputs:
                 indexICME = ICME_df[source]
             
             # Where an ICME is present, set U, Br to NaN
-            insitu_noICME = self.availableBackgroundData[source]
+            insitu_noICME = self.availableBackgroundData[source].copy()
             insitu_noICME['mjd'] = self.availableBackgroundData['mjd']
             insitu_noICME.loc[indexICME, ['U', 'Br']] = np.nan
             
-            new_insitu_list = []
-            covariance_list = []
+            # new_insitu_list = []
+            # covariance_list = []
             # sample_func_df = pd.DataFrame(columns=['start_mjd', 'stop_mjd', 'func'])
             
             # Pass the insitu DataFrame to the correct parser
@@ -506,7 +502,7 @@ class multihuxt_inputs:
     
     def _impute_backgroundDistributions(self, df, carrington_period,
                                         target_variables = ['U', 'Br'],
-                                        cluster_distance_limit = 1e-3,
+                                        cluster_distance_limit = 1e-2,
                                         max_chunk_length = 1024,
                                         num_samples = 0):
         import gpflow
@@ -517,6 +513,11 @@ class multihuxt_inputs:
         from sklearn.cluster import KMeans
         import multiprocessing as mp
         from joblib import Parallel, delayed
+        
+        # Cap this at 0.01: we don't see much improvement beyond this, and it causes numerical uissues
+        if cluster_distance_limit < 1e-2:
+            print("Cluster Distances smaller than ~0.01 may cause numerical issues. Adjusting to 0.01 now.")
+            cluster_distance_limit = 1e-2
         
         backgroundDistribution_df = pd.DataFrame(index=df.index)
         backgroundSamples = [backgroundDistribution_df.copy() for _ in range(num_samples)]
@@ -539,8 +540,6 @@ class multihuxt_inputs:
             # =================================================================
             period_rescaled = carrington_period.to(u.day).value * mjd_scaler.scale_[0]
             period_gp = gpflow.Parameter(period_rescaled, trainable=False)
-            
-            
             
             # Only predict 1 Carrington Rotation forward
             min_x = 0
@@ -585,6 +584,7 @@ class multihuxt_inputs:
             # Find the optimized number of clusters to meet our target rel. error
             # average_inertia = np.array(inertia)/n_points
             n_clusters_optimized = np.interp(cluster_distance_limit, distances_90p, n_clusters_test).astype(int)
+            cluster_distance_optimized = np.interp(n_clusters_optimized, n_clusters_test[::-1], distances_90p[::-1])
             
             # Cluster data, then create chunks of clusters for optimization
             kmeans = KMeans(n_clusters=n_clusters_optimized,
@@ -609,7 +609,7 @@ class multihuxt_inputs:
             # =============================================================================
             # Plug into the ensemble GP model
             # =============================================================================
-            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, cluster_distance_limit)
+            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, cluster_distance_optimized)
             # model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, None)
             
             # =================================================================
@@ -617,19 +617,19 @@ class multihuxt_inputs:
             # and inverse transform
             # =================================================================
             Xo = mjd_scaler.transform(df['mjd'].to_numpy()[:, None])
-            fo_mu, fo_var = model.predict_f(Xo)
+            fo_mu, fo_var = model.predict_f(Xo, chunk_size=2048, cpu_fraction=0.6)
             fo_sig = np.sqrt(fo_var)
-            yo_mu, yo_var = model.predict_y(Xo)
-            yo_sig = np.sqrt(yo_var)
+            # yo_mu, yo_var = model.predict_y(Xo)
+            # yo_sig = np.sqrt(yo_var)
             
-            fo_samples = model.predict_f_samples(Xo, num_samples)
+            fo_samples = model.predict_f_samples(Xo, num_samples, chunk_size=2048, cpu_fraction=0.6)
             
             mjd = df['mjd'].to_numpy()
             val_f_mu = val_scaler.inverse_transform(fo_mu).flatten()
             val_f_sigma = (val_scaler.scale_ * fo_sig).flatten()
             val_f_samples = [val_scaler.inverse_transform(fo).flatten() for fo in fo_samples]
-            val_y_mu = val_scaler.inverse_transform(yo_mu).flatten()
-            val_y_sigma = (val_scaler.scale_ * yo_sig).flatten()
+            # val_y_mu = val_scaler.inverse_transform(yo_mu).flatten()
+            # val_y_sigma = (val_scaler.scale_ * yo_sig).flatten()
             
             backgroundDistribution_df['mjd'] = mjd
             backgroundDistribution_df[target_var+'_mu'] = val_f_mu
@@ -978,7 +978,7 @@ class multihuxt_inputs:
         
         return
     
-    def generate_boundaryDistribution3D(self, nLat=32, extend=None, GP=True):
+    def generate_boundaryDistribution3D(self, nLat=32, extend=None, GP=True, num_samples=0):
         
         # Get dimensions from OMNI boundary distribution, which *must* exist
         nLon, nTime = self.boundaryDistributions['omni']['U_mu_grid'].shape
@@ -995,18 +995,46 @@ class multihuxt_inputs:
         if type(extend) == str:
             U_mu_3d, U_sigma_3d, B_3d = self._extend_boundaryDistributions(nLat, extend)
         elif GP is True:
-            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d)
+            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d, num_samples=num_samples)
             
-        
-        self.boundaryDistributions3D = {'t_grid': mjd_for3d,
-                                        'lon_grid': lon_for3d,
-                                        'lat_grid': lat_for3d,
-                                        'U_mu_grid': U_mu_3d,
-                                        'U_sig_grid': U_sigma_3d,
-                                        'B_grid': B_3d,
-                                        }
+        self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d,
+                                             U_mu_3d, U_sigma_3d, B_3d)
         
         return
+    
+    def _assign_boundaryDistributions3D(self, t_grid, lon_grid, lat_grid, U_mu_grid, U_sig_grid, B_grid):
+        """
+        This method is independent of generate_boundaryDistributions3D to allow
+        assignment to attribute within the _extend and _impute methods, and 
+        thus to allow easier testing
+
+        Parameters
+        ----------
+        t_grid : TYPE
+            DESCRIPTION.
+        lon_grid : TYPE
+            DESCRIPTION.
+        lat_grid : TYPE
+            DESCRIPTION.
+        U_mu_grid : TYPE
+            DESCRIPTION.
+        U_sig_grid : TYPE
+            DESCRIPTION.
+        B_grid : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+        self.boundaryDistributions3D = {'t_grid': t_grid,
+                                        'lon_grid': lon_grid,
+                                        'lat_grid': lat_grid,
+                                        'U_mu_grid': U_mu_grid,
+                                        'U_sig_grid': U_sig_grid,
+                                        'B_grid': B_grid,
+                                        }
         
     def _extend_boundaryDistributions(self, nLat, name):
         
@@ -1027,7 +1055,8 @@ class multihuxt_inputs:
         
     def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d,
                                       cluster_distance_limit=0.005,
-                                      max_chunk_length=2048):
+                                      max_chunk_length=2048,
+                                      num_samples=0):
         import gpflow
         import tensorflow as tf
         from sklearn.preprocessing import StandardScaler, MinMaxScaler, FunctionTransformer
@@ -1036,6 +1065,7 @@ class multihuxt_inputs:
         from sklearn.cluster import KMeans
         import multiprocessing as mp
         from joblib import Parallel, delayed
+        from sklearn.cluster import MiniBatchKMeans
         
         # cluster_distance_limit = 0.001
         # max_chunk_length = 1024
@@ -1121,7 +1151,7 @@ class multihuxt_inputs:
         
         lat_scale_min = 0 * lat_scaler.scale_
         lat_scale_mid = 1 * lat_scaler.scale_
-        lat_scale_max = 5 * lat_scaler.scale_
+        lat_scale_max = 10 * lat_scaler.scale_
         lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
            transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
         
@@ -1152,7 +1182,7 @@ class multihuxt_inputs:
         
         all_kernel = gpflow.kernels.RationalQuadratic()
         kernel_mu = (lat_kernel + lon_kernel + mjd_kernel + 
-                     # lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
+                     lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
                      all_kernel)
         
         kernel_sigma = copy.deepcopy(kernel_mu)
@@ -1167,14 +1197,17 @@ class multihuxt_inputs:
         XY_mu = np.column_stack([X, Y_mu])
         XY_sigma = np.column_stack([X, Y_sigma])
         
-        # Test values of n_clusters varying from clusters of size 5 to 40
+        # Test values of n_clusters varying from
         n_points = len(Y_mu)
-        n_clusters_test = (n_points / np.logspace(np.log(2), 2, 20)).astype(int)
+        n_clusters_test = (n_points / np.logspace(np.log10(3), 2, 30)).astype(int)
         
         # inertia = []
         distances_90p = []
         for n_clusters in tqdm.tqdm(n_clusters_test, desc='Optimizing Clustering for GP'):
-            kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
+            # kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
+            mbkmeans = MiniBatchKMeans(init="k-means++", n_clusters=n_clusters, batch_size=4096,
+                                       n_init="auto", max_no_improvement=50, verbose=0)
+            kmeans = mbkmeans.fit(XY_mu)
             # inertia.append(kmeans.inertia_)
             kmeans_distances = []
             for i in range(kmeans.n_clusters):
@@ -1186,7 +1219,7 @@ class multihuxt_inputs:
         # Find the optimized number of clusters to meet our target rel. error
         # average_inertia = np.array(inertia)/n_points
         n_clusters_optimized = np.interp(cluster_distance_limit, distances_90p, n_clusters_test).astype(int)
-        
+        cluster_distance_optimized = np.interp(n_clusters_optimized, n_clusters_test[::-1], distances_90p[::-1])
         # breakpoint()
         
         # Cluster data, then create chunks of clusters for optimization
@@ -1211,10 +1244,10 @@ class multihuxt_inputs:
         Xc_sigma_chunks = [chunk[:,0:3] for chunk in XYc_sigma_chunks]
         Yc_sigma_chunks = [chunk[:,3][:,None] for chunk in XYc_sigma_chunks]
         
-        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, cluster_distance_limit)
+        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, cluster_distance_optimized)
         
-        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, cluster_distance_limit)
-
+        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, cluster_distance_optimized)
+        
         # =============================================================================
         # Predict values for the full grid...     
         # =============================================================================
@@ -1227,53 +1260,29 @@ class multihuxt_inputs:
                                Xmjd.flatten()[:,None]])
         
         # Parallel chunk processing 
-        # This is ~3x faster than non-parallel processing
-        print("Beginning Parallel Assignment")
-        t0 = time.time()
-        nCores = int(0.75 * mp.cpu_count()) 
-        chunksize = 4096
-        X3d_chunks = [X3d[pos:pos + chunksize] for pos in range(0, len(X3d), chunksize)]
+        fmu3d_mu, fmu3d_var = model_mu.predict_f(X3d, chunk_size=4096, cpu_fraction=0.75)
+        # fmu_samples = model_mu.predict_f_samples(X3d, num_samples, chunk_size=4096, cpu_fraction=0.75)
         
-        def process(model, X3d_chunk):
-            Ymu_chunk, Ysigma2_chunk = model.predict_f(X3d_chunk)
-            
-            # Ymumu, Ymusigma2 = Ymu_chunk[:,0], Ymu_chunk[:,1]
-            # Ymusigma = tf.sqrt(Ymusigma2)
-            
-            # Ysigmamu, Ysigmasigma2 = Ysigma_chunk[:,0], Ysigma_chunk[:,1]
-            # Ysigmasigma = tf.sqrt(Ysigmasigma2)
-            
-            # return Ymumu, Ymusigma, Ysigmamu, Ysigmasigma
-            
-            return Ymu_chunk, tf.sqrt(Ysigma2_chunk)
+        val_mu_mu = val_mu_scaler.inverse_transform(fmu3d_mu).reshape(nLat, nLon, nMjd)
+        val_mu_sig = val_mu_scaler.scale_ * tf.sqrt(fmu3d_var).numpy().reshape(nLat, nLon, nMjd)
         
-        mu_generator = Parallel(return_as='generator', n_jobs=nCores)(
-            delayed(process)(model_mu, X3d_chunk) 
-            for X3d_chunk in X3d_chunks
-            )
-        Ymu_chunklist = list(tqdm.tqdm(mu_generator, total=len(X3d_chunks)))
-        print("Time elapsed: {:.1f} s".format(time.time() - t0))
+
         
-        sigma_generator = Parallel(return_as='generator', n_jobs=nCores)(
-            delayed(process)(model_sigma, X3d_chunk) 
-            for X3d_chunk in X3d_chunks
-            )
-        Ysigma_chunklist = list(tqdm.tqdm(sigma_generator, total=len(X3d_chunks)))
+        # For the standard deviation
+        fsig3d_mu, fsig3d_var = model_sigma.predict_f(X3d, chunk_size=4096, cpu_fraction=0.75)
+        # fsig_samples = model_sigma.predict_f_samples(X3d, num_samples, chunk_size=4096, cpu_fraction=0.75)
         
-        Ymu = np.concatenate([elem[0] for elem in Ymu_chunklist], axis=0)
-        Ymusigma = np.concatenate([elem[1] for elem in Ymu_chunklist], axis=0)
-        Ysigma = np.concatenate([elem[0] for elem in Ysigma_chunklist], axis=0)
-        Ysigmasigma = np.concatenate([elem[1] for elem in Ysigma_chunklist], axis=0)
+        val_sig_mu = val_sigma_scaler.inverse_transform(fsig3d_mu).reshape(nLat, nLon, nMjd)
         
-        # !!!! Add individual samples 
+        # The uncertainty on the uncertainty is difficult to quantify
         
-        
-        U_mu = val_mu_scaler.inverse_transform(Ymu)
-        U_sigma = np.sqrt(val_sigma_scaler.inverse_transform(Ysigma)**2 + (val_mu_scaler.scale_ * Ymusigma)**2)
-        # U_sigma = val_sigma_scaler.inverse_transform(Ysigma)
-        
-        U_mu_3d = U_mu.reshape(nLat, nLon, nMjd)
-        U_sigma_3d = U_sigma.reshape(nLat, nLon, nMjd)
+        # val_sig_sig = val_sigma_scaler.scale_ * tf.sqrt(fsig3d_var).reshape(nLat, nLon, nMjd)
+        # test0 = val_sigma_scaler.inverse_transform(fsig3d_mu + tf.sqrt(fsig3d_var)).reshape(nLat, nLon, nMjd) - val_sig_mu
+        # test1 = val_sig_mu - val_sigma_scaler.inverse_transform(fsig3d_mu - tf.sqrt(fsig3d_var)).reshape(nLat, nLon, nMjd)
+
+        # !!!! Eventually, val will apply to both U and B...
+        U_mu_3d = val_mu_mu
+        U_sigma_3d = np.sqrt(val_mu_sig**2 + val_sig_mu**2)
         
         # =============================================================================
         # Generate the prediction for the clusters, then interpolate out?
@@ -1282,12 +1291,17 @@ class multihuxt_inputs:
         # Generate an OBVIOUSLY WRONG B
         B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
         
+        print("Check for prediction quality!")
+        breakpoint()
+        # Assign to self
+        # Sample at OMNI/STA
+        
         return U_mu_3d, U_sigma_3d, B_3d
         
         # =============================================================================
         # Visualization     
         # =============================================================================
-        breakpoint()
+        
         # for source in self.boundarySources:
             
         #     # Reconstruct the backmapped solar wind view at each source
@@ -1750,13 +1764,15 @@ class multihuxt_inputs:
                 weighted_median = vals[valsort_indx[np.searchsorted(cumsum_weights, 0.5 * cumsum_weights[-1])]]
                 weighted_upper95 = vals[valsort_indx[np.searchsorted(cumsum_weights, 0.975 * cumsum_weights[-1])]]
                 weighted_lower95 = vals[valsort_indx[np.searchsorted(cumsum_weights, 0.025 * cumsum_weights[-1])]]
-                
+
                 if col in columns:
                     metamodel.loc[index, col+"_median"] = weighted_median
                     metamodel.loc[index, col+"_upper95"] = weighted_upper95
                     metamodel.loc[index, col+"_lower95"] = weighted_lower95
                 else:
                     metamodel.loc[index, col] = weighted_median
+                    
+                breakpoint()
         
         return metamodel
     
@@ -1785,6 +1801,14 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, ephe
     return vcarr_inner
 
 # %%
+import gpflow
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, FunctionTransformer
+from sklearn.pipeline import Pipeline
+# from scipy.cluster.vq import kmeans
+from sklearn.cluster import KMeans
+import multiprocessing as mp
+from joblib import Parallel, delayed
 class GPFlowEnsemble:
     def __init__(self, kernel, X_list, Y_list, noise_variance):
     
@@ -1831,58 +1855,195 @@ class GPFlowEnsemble:
         
         return
     
-    def predict_f(self, X_new):
+    # def predict_f(self, X_new):
         
-        weights = self.calculate_weights(X_new)
         
-        result_mu = np.full((len(X_new), 1), 0, dtype='float64')
-        result_sigma2 = np.full((len(X_new), 1), 0, dtype='float64')
-        for w, model in zip(weights, self.model_list):
-            f_mu, f_sigma2 = model.predict_f(X_new)
+        
+    #     weights = self.calculate_weights(X_new)
+        
+    #     result_mu = np.full((len(X_new), 1), 0, dtype='float64')
+    #     result_sigma2 = np.full((len(X_new), 1), 0, dtype='float64')
+    #     for w, model in zip(weights, self.model_list):
+    #         f_mu, f_sigma2 = model.predict_f(X_new)
             
-            result_mu += w[:,None] * f_mu.numpy()
-            result_sigma2 += w[:,None] * f_sigma2.numpy()
+    #         result_mu += w[:,None] * f_mu.numpy()
+    #         result_sigma2 += w[:,None] * f_sigma2.numpy()
             
-        return result_mu, result_sigma2
+    #     return result_mu, result_sigma2
     
-    def predict_f_samples(self, X_new, num_samples=1):
+    def predict_f(self, X_new, chunk_size=None, cpu_fraction=None):
+        """
+        Predict the values of f, the underlying function of GP regression, 
+        without measurement errors.
+        If chunksize is supplied, do the prediction in parallel.
+
+        Parameters
+        ----------
+        X_new : TYPE
+            DESCRIPTION.
+        nCores : TYPE, optional
+            DESCRIPTION. The default is None.
+        chunksize : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+        TYPE
+            DESCRIPTION.
+
+        """
+        if chunk_size is None:
+            chunk_size = len(X_new)
+        if cpu_fraction is None:
+            cpu_fraction = 0.50
         
-        weights = self.calculate_weights(X_new)
+        n_jobs = int(cpu_fraction * mp.cpu_count())
         
-        result = np.full((num_samples, len(X_new), 1), 0, dtype='float64')
-        for w, model in zip(weights, self.model_list):
-            f_samples = model.predict_f_samples(X_new, num_samples)
-            
-            result += np.tile(w[:,None], (num_samples, 1, 1)) * f_samples.numpy()
+        X_new_chunked = [X_new[pos:pos + chunk_size] for pos in range(0, len(X_new), chunk_size)]
         
-        return result
+        def _predict_f(GPFlowEnsemble, _X):
+            weights = GPFlowEnsemble.calculate_weights(_X)
+            result_mu = np.full((len(_X), 1), 0, dtype='float64')
+            result_sigma2 = np.full((len(_X), 1), 0, dtype='float64')
+            for w, model in zip(weights, GPFlowEnsemble.model_list):
+                f_mu, f_sigma2 = model.predict_f(_X)
+                
+                result_mu += w[:,None] * f_mu.numpy()
+                result_sigma2 += w[:,None] * f_sigma2.numpy()
+                
+            return result_mu, result_sigma2
+        
+        # Avoid the parallelization overhead if chunk_size == len(X_new)
+        if len(X_new_chunked) > 1:
+            generator = Parallel(return_as='generator', n_jobs=n_jobs)(
+                delayed(_predict_f)(self, X_chunk) for X_chunk in X_new_chunked)
+        
+            results = list(tqdm.tqdm(generator, total=len(X_new_chunked)))
+        else:
+            results = _predict_f(self, X_new)
+        
+        results_mu = np.vstack([r[0] for r in results])
+        results_sigma2 = np.vstack([r[1] for r in results])
+
+        return results_mu, results_sigma2
     
-    def predict_y(self, X_new):
-        
-        weights = self.calculate_weights(X_new)
-        
-        result_mu = np.full((len(X_new), 1), 0, dtype='float64')
-        result_sigma2 = np.full((len(X_new), 1), 0, dtype='float64')
-        for w, model in zip(weights, self.model_list):
-            y_mu, y_sigma2 = model.predict_y(X_new)
-            
-            result_mu += w[:,None] * y_mu.numpy()
-            result_sigma2 += w[:,None] * y_sigma2.numpy()
-            
-        return result_mu, result_sigma2
-    
-    # def predict_y_samples(self, X_new, num_samples=1):
+    # def predict_f_samples(self, X_new, num_samples=1):
         
     #     weights = self.calculate_weights(X_new)
         
     #     result = np.full((num_samples, len(X_new), 1), 0, dtype='float64')
     #     for w, model in zip(weights, self.model_list):
     #         f_samples = model.predict_f_samples(X_new, num_samples)
-    #         y_samples = model.likelihood.conditional_sample(f_samples, sample_shape=f_samples.shape)
             
-    #         result += np.tile(w[:,None], (num_samples, 1, 1)) * y_samples.numpy()
+    #         result += np.tile(w[:,None], (num_samples, 1, 1)) * f_samples.numpy()
         
     #     return result
+    
+    def predict_f_samples(self, X_new, num_samples=1, chunk_size=None, cpu_fraction=None):
+        """
+        Predict the values of f, the underlying function of GP regression, 
+        without measurement errors.
+        If chunksize is supplied, do the prediction in parallel.
+
+        Parameters
+        ----------
+        X_new : TYPE
+            DESCRIPTION.
+        nCores : TYPE, optional
+            DESCRIPTION. The default is None.
+        chunksize : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+        TYPE
+            DESCRIPTION.
+
+        """
+        if chunk_size is None:
+            chunk_size = len(X_new)
+        if cpu_fraction is None:
+            cpu_fraction = 0.50
+        
+        n_jobs = int(cpu_fraction * mp.cpu_count())
+        
+        X_new_chunked = [X_new[pos:pos + chunk_size] for pos in range(0, len(X_new), chunk_size)]
+        
+        def _predict_f_samples(GPFlowEnsemble, _X):
+            weights = GPFlowEnsemble.calculate_weights(_X)
+            result = np.full((num_samples, len(_X), 1), 0, dtype='float64')
+            for w, model in zip(weights, GPFlowEnsemble.model_list):
+                f_samples = model.predict_f_samples(_X, num_samples)
+                result += np.tile(w[:,None], (num_samples, 1, 1)) * f_samples.numpy()
+                
+            return result
+        
+        # Avoid the parallelization overhead if chunk_size == len(X_new)
+        if len(X_new_chunked) > 1:
+            generator = Parallel(return_as='generator', n_jobs=n_jobs)(
+                delayed(_predict_f_samples)(self, X_chunk) for X_chunk in X_new_chunked)
+        
+            results = list(tqdm.tqdm(generator, total=len(X_new_chunked)))
+        else:
+            results = _predict_f_samples(self, X_new)
+        
+        results = np.concatenate(results, axis=1)
+        
+        return results
+    
+    # def predict_y(self, X_new):
+        
+    #     weights = self.calculate_weights(X_new)
+        
+    #     result_mu = np.full((len(X_new), 1), 0, dtype='float64')
+    #     result_sigma2 = np.full((len(X_new), 1), 0, dtype='float64')
+    #     for w, model in zip(weights, self.model_list):
+    #         y_mu, y_sigma2 = model.predict_y(X_new)
+            
+    #         result_mu += w[:,None] * y_mu.numpy()
+    #         result_sigma2 += w[:,None] * y_sigma2.numpy()
+            
+    #     return result_mu, result_sigma2
+    
+    def predict_y(self, X_new, chunk_size=None, cpu_fraction=None):
+        if chunk_size is None:
+            chunk_size = len(X_new)
+        if cpu_fraction is None:
+            cpu_fraction = 0.50
+        
+        n_jobs = int(cpu_fraction * mp.cpu_count())
+        
+        X_new_chunked = [X_new[pos:pos + chunk_size] for pos in range(0, len(X_new), chunk_size)]
+        
+        def _predict_y(GPFlowEnsemble, _X):
+            weights = GPFlowEnsemble.calculate_weights(_X)
+            result_mu = np.full((len(_X), 1), 0, dtype='float64')
+            result_sigma2 = np.full((len(_X), 1), 0, dtype='float64')
+            for w, model in zip(weights, GPFlowEnsemble.model_list):
+                y_mu, y_sigma2 = model.predict_y(_X)
+                
+                result_mu += w[:,None] * y_mu.numpy()
+                result_sigma2 += w[:,None] * y_sigma2.numpy()
+                
+            return result_mu, result_sigma2
+        
+        # Avoid the parallelization overhead if chunk_size == len(X_new)
+        if len(X_new_chunked) > 1:
+            generator = Parallel(return_as='generator', n_jobs=n_jobs)(
+                delayed(_predict_y)(self, X_chunk) for X_chunk in X_new_chunked)
+        
+            results = list(tqdm.tqdm(generator, total=len(X_new_chunked)))
+        else:
+            results = _predict_y(self, X_new)
+        
+        results_mu = np.vstack([r[0] for r in results])
+        results_sigma2 = np.vstack([r[1] for r in results])
+
+        return results_mu, results_sigma2
     
     def calculate_weights(self, X_new):
         import scipy
