@@ -8,46 +8,13 @@ Created on Tue Aug 19 12:29:25 2025
 import astropy.units as u
 from astropy.time import Time
 import datetime
-# import datetime
-# import os
-# import astropy.units as u
-# import glob
-# import re
 import numpy as np
-import time
 from sunpy.net import Fido
 from sunpy.net import attrs
 from sunpy.timeseries import TimeSeries
-# import requests
-import matplotlib.pyplot as plt
-import pandas as pd
-from astroquery.jplhorizons import Horizons
-# import dask
-import pickle
-import tqdm
-import copy
-import tensorflow as tf
 import scipy
-
-import sys
-sys.path.append('/Users/mrutala/projects/HUXt/code/')
-sys.path.append('/Users/mrutala/projects/OHTransients/code/')
-import huxt as H
-import huxt_analysis as HA
-import huxt_inputs as Hin
-import huxt_atObserver as hao
-# from scipy import ndimage
-# from scipy import stats
-# from sklearn.metrics import root_mean_squared_error as rmse
-# from astroquery.jplhorizons import Horizons
-
-# import huxt_inputs_wsa as Hin_wsa
-import queryDONKI
-
-try:
-    plt.style.use('/Users/mrutala/code/python/mjr.mplstyle')
-except:
-    pass
+from pathlib import Path
+import pandas as pd
 
 def lookup_omni(starttime, stoptime):
     """
@@ -115,7 +82,6 @@ def lookup_omni(starttime, stoptime):
     
     return omni
 
-from pathlib import Path
 class SolarWindData:
     def __init__(self, source, start, stop):
         self.input_source = source
@@ -123,7 +89,7 @@ class SolarWindData:
         self.start = start
         self.stop = stop
         self.resolution = '1h'
-        self.variables = ['U', 'B', 'Br']
+        self.variables = ['U', 'n', 'B', 'Br']
         
         self.path = Path('/Users/mrutala/projects/OHTransients/data/')
         filename = (source + ' 1hr.csv.zip').replace(' ', '_')
@@ -179,16 +145,17 @@ class SolarWindData:
                 data_df = pd.concat(partial_dfs, axis='index')
                 data_df.sort_index(inplace=True)
                 
-                # # Save the new data
-                # self.update_csv(data_df)
-                
             # if missing_set has 0 len, we already have what we need
             else:
                 pass
             
         else:
             data_df = fn(self.start, self.stop)
-            
+        
+        # very minor post-processing to decrease NaNs
+        data_df = data_df.interpolate('time', limit=6, 
+                                      limit_direction='both', limit_area='inside')
+        
         # Assign this to self.data
         for col in self.data.columns:
             if col in data_df.columns:
@@ -252,7 +219,6 @@ class SolarWindData:
                            'voyager 2': self.voyager2,}
         return LookupFunctions[self.source]
     
-    
     def _fetch(self, source, datasetID, start, stop):
         # Mute warnings
         import warnings
@@ -266,18 +232,24 @@ class SolarWindData:
         expected_df = pd.DataFrame(index = expected_index[:-1])
 
         # 
-        try:
-            dataset = attrs.cdaweb.Dataset(datasetID)
-            result = Fido.search(timerange, dataset)
-            downloaded_files = Fido.fetch(result, path = str(self.path / source.upper()) + '/{file}')
-        except:
-            breakpoint()
+        dataset = attrs.cdaweb.Dataset(datasetID)
+        result = Fido.search(timerange, dataset)
+        downloaded_files = Fido.fetch(result, path = str(self.path / source.upper()) + '/{file}')
+        
+        # Check for errors and retry if needed
+        retry_count = 0
+        while len(downloaded_files.errors) > 0:
+            downloaded_files = Fido.fetch(downloaded_files)
+            retry_count += 1
+            if retry_count > 10:
+                breakpoint()
         
         # If there's any files to download, download them and get the dataframe
         if len(downloaded_files) > 0:
             # Combine the data for this source into one df
             try:
                 df = TimeSeries(downloaded_files, concatenate=True).to_dataframe()
+            
             except ValueError:
                 # Some time series have an extra, errant 0 in a data column, which breaks the TimeSeries assignment
                 # In these cases, we can do this manually...
@@ -344,6 +316,7 @@ class SolarWindData:
         
         # Which columns to keep, and what to call them
         column_map = {'V': 'U',
+                      'N': 'n',
                       'ABS_B': 'B',
                       'BR': 'Br'}
         # Get the data
@@ -368,8 +341,10 @@ class SolarWindData:
         columns_maps = {
             'STA_COHO1HR_MERGED_MAG_PLASMA':    {'B': 'B',
                                                  'BR': 'Br',
-                                                 'plasmaSpeed': 'U'},
-            'STA_L2_PLA_1DMAX_1MIN':            {'proton_bulk_speed': 'U'},
+                                                 'plasmaSpeed': 'U',
+                                                 'plasmaDensity': 'n'},
+            'STA_L2_PLA_1DMAX_1MIN':            {'proton_bulk_speed': 'U',
+                                                 'proton_number_density': 'n'},
             'STA_L1_MAG_RTN':                   {'BFIELD_3': 'B',
                                                  'BFIELD_0': 'Br'}
                         }
@@ -406,6 +381,7 @@ class SolarWindData:
         
         # Which columns to keep, and what to call them
         column_map = {'plasmaSpeed': 'U',
+                      'plasmaDensity': 'n',
                       'B': 'B',
                       'BR': 'Br',}
         
@@ -471,7 +447,7 @@ class SolarWindData:
         
         # Which columns to keep, and what to call them
         column_map = {'plasmaFlowSpeed': 'U',
-                      'B': 'B',
+                      'ABS_B': 'B',
                       'BR': 'Br',}
         
         # Get the data
