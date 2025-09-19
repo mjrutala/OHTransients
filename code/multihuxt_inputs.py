@@ -339,7 +339,7 @@ class multihuxt_inputs:
     def generate_backgroundDistributions(self, insitu=None, ICME_df=None, 
                                          inducing_variable=True,
                                          GP = False, extend = False,
-                                         cluster_distance_limit = 0.001,
+                                         target_noise = 1e-2,
                                          max_chunk_length = 1024,
                                          num_samples = 0,):
         target_variables = ['U']
@@ -387,7 +387,7 @@ class multihuxt_inputs:
                 summary, samples = self._impute_backgroundDistributions(insitu_noICME, 
                     carrington_period,
                     target_variables=target_variables, 
-                    cluster_distance_limit=cluster_distance_limit,
+                    target_noise=target_noise,
                     max_chunk_length=max_chunk_length,
                     num_samples=num_samples)
             else:
@@ -502,7 +502,7 @@ class multihuxt_inputs:
     
     def _impute_backgroundDistributions(self, df, carrington_period,
                                         target_variables = ['U', 'Br'],
-                                        cluster_distance_limit = 1e-2,
+                                        target_noise = 1e-2,
                                         max_chunk_length = 1024,
                                         num_samples = 0):
         import gpflow
@@ -515,9 +515,9 @@ class multihuxt_inputs:
         from joblib import Parallel, delayed
         
         # Cap this at 0.01: we don't see much improvement beyond this, and it causes numerical uissues
-        if cluster_distance_limit < 1e-2:
-            print("Cluster Distances smaller than ~0.01 may cause numerical issues. Adjusting to 0.01 now.")
-            cluster_distance_limit = 1e-2
+        # if cluster_distance_limit < 1e-4:
+        #     print("Cluster Distances smaller than ~0.0001 may cause numerical issues. Adjusting to 0.0001 now.")
+        #     cluster_distance_limit = 1e-4
         
         backgroundDistribution_df = pd.DataFrame(index=df.index)
         backgroundSamples = [backgroundDistribution_df.copy() for _ in range(num_samples)]
@@ -563,43 +563,10 @@ class multihuxt_inputs:
             X = xmjd
             Y = yval
             
-            XY = np.column_stack([X, Y])
+            Xc, Yc, optimized_noise = self._optimize_clustering(X, Y, target_noise)
+            XYc = np.column_stack([Xc, Yc])
             
-            # Test values of n_clusters varying from clusters of size 5 to 40
-            n_points = len(Y)
-            n_clusters_test = (n_points / np.logspace(0, 2, 20)).astype(int)
-            
-            # inertia = []
-            distances_90p = []
-            for n_clusters in tqdm.tqdm(n_clusters_test, desc='Optimizing Clustering for GP'):
-                kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY)
-                # inertia.append(kmeans.inertia_)
-                kmeans_distances = []
-                for i in range(kmeans.n_clusters):
-                    diff = XY[kmeans.labels_==i,:] - kmeans.cluster_centers_[i]
-                    _kmeans_distances = np.linalg.norm(diff, axis=1)
-                    kmeans_distances.extend(_kmeans_distances)
-                distances_90p.append(np.percentile(kmeans_distances, 90))
-            
-            # Find the optimized number of clusters to meet our target rel. error
-            # average_inertia = np.array(inertia)/n_points
-            n_clusters_optimized = np.interp(cluster_distance_limit, distances_90p, n_clusters_test).astype(int)
-            cluster_distance_optimized = np.interp(n_clusters_optimized, n_clusters_test[::-1], distances_90p[::-1])
-            
-            # Cluster data, then create chunks of clusters for optimization
-            kmeans = KMeans(n_clusters=n_clusters_optimized,
-                            random_state=0,
-                            n_init="auto").fit(XY)
-            
-            kmeans_distances = []
-            for i in range(kmeans.n_clusters):
-                _kmeans_distances = np.linalg.norm(XY[kmeans.labels_==i,:] - kmeans.cluster_centers_[i], axis=1)
-                kmeans_distances.extend(_kmeans_distances)
-
-            
-            XYc = kmeans.cluster_centers_
-            
-            n_chunks = int(np.ceil(n_clusters_optimized/max_chunk_length))
+            n_chunks = int(np.ceil(len(Xc)/max_chunk_length))
             
             sort = np.argsort(XYc[:,0]) # sort by MJD
             XYc_chunks = np.array_split(XYc[sort,:], n_chunks)
@@ -609,8 +576,7 @@ class multihuxt_inputs:
             # =============================================================================
             # Plug into the ensemble GP model
             # =============================================================================
-            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, cluster_distance_optimized)
-            # model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, None)
+            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, optimized_noise)
             
             # =================================================================
             # Get predictions for all MJD (filling in gaps)
@@ -978,7 +944,7 @@ class multihuxt_inputs:
         
         return
     
-    def generate_boundaryDistribution3D(self, nLat=32, extend=None, GP=True, num_samples=0):
+    def generate_boundaryDistribution3D(self, nLat=16, extend=None, GP=True, num_samples=0, target_noise=0.10):
         
         # Get dimensions from OMNI boundary distribution, which *must* exist
         nLon, nTime = self.boundaryDistributions['omni']['U_mu_grid'].shape
@@ -995,7 +961,7 @@ class multihuxt_inputs:
         if type(extend) == str:
             U_mu_3d, U_sigma_3d, B_3d = self._extend_boundaryDistributions(nLat, extend)
         elif GP is True:
-            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d, num_samples=num_samples)
+            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d, num_samples=num_samples, target_noise=target_noise)
             
         self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d,
                                              U_mu_3d, U_sigma_3d, B_3d)
@@ -1054,8 +1020,8 @@ class multihuxt_inputs:
         return
         
     def _impute_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d,
-                                      cluster_distance_limit=0.005,
-                                      max_chunk_length=2048,
+                                      target_noise = 0.10,
+                                      max_chunk_length=1024,
                                       num_samples=0):
         import gpflow
         import tensorflow as tf
@@ -1089,7 +1055,7 @@ class multihuxt_inputs:
         val_mu_scaler = StandardScaler()
 
         val_sigma_scaler = Pipeline([
-            ('log_transform', FunctionTransformer(np.log1p, inverse_func=np.expm1)),
+            ('log_transform', FunctionTransformer(np.log1p, inverse_func=np.expm1, check_inverse=False)),
             ('scaler', StandardScaler()),
             ])
 
@@ -1144,35 +1110,35 @@ class multihuxt_inputs:
         val_sigma_scaler.fit(val_sigma[:,None])
         yval_sigma = val_sigma_scaler.transform(val_sigma[~np.isnan(val_mu),None])
 
-        # =============================================================================
-        #         # Define kernel for each dimension separately, then altogether
-        # =============================================================================
-        # breakpoint()
+        # %% ==================================================================
+        # GP Kernel Definitions
+        # =====================================================================
         
         lat_scale_min = 0 * lat_scaler.scale_
         lat_scale_mid = 1 * lat_scaler.scale_
-        lat_scale_max = 10 * lat_scaler.scale_
+        lat_scale_max = 5 * lat_scaler.scale_
         lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
            transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
         
         mjd_scale_min = 0.0
-        mjd_scale_mid = 25.38 * mjd_scaler.scale_
-        mjd_scale_max = 3 * 25.38 * mjd_scaler.scale_
-        if mjd_scale_max > 1: mjd_scale_max = 1
+        mjd_scale_mid = 3 * 25.38 * mjd_scaler.scale_
+        mjd_scale_max = 6 * 25.38 * mjd_scaler.scale_
+        # if mjd_scale_mid > 0.9: mjd_scale_mid[0] = 0.9
+        # if mjd_scale_max > 1.0: mjd_scale_max[0] = 1.0
         mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
            transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
         
         lon_scale_min = np.float64(0.0)
         lon_scale_mid = np.float64(0.5)
-        lon_scale_max = np.float64(1.0)
+        lon_scale_max = np.float64(10.0)
         lon_lengthscale = gpflow.Parameter(lon_scale_mid, 
            transform = tfp.bijectors.SoftClip(lon_scale_min, lon_scale_max))
         
         lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0], lengthscales=lat_lengthscale)
         
         period_gp = gpflow.Parameter(1, trainable=False)
-        base_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=lon_lengthscale)
-        amplitude_kernel = gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=lon_lengthscale)
+        base_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
+        amplitude_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
         period_kernel = gpflow.kernels.Periodic(
             gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
             period=period_gp)
@@ -1187,70 +1153,45 @@ class multihuxt_inputs:
         
         kernel_sigma = copy.deepcopy(kernel_mu)
         
-        # =============================================================================
-        # ~Fancy~ Chunking  
-        # =============================================================================
+        # %% ==================================================================
+        # Optimize Clustering & Cluster
+        # =====================================================================
         X = np.column_stack([xlat, xlon, xmjd])
         Y_mu = yval_mu
         Y_sigma = yval_sigma
         
-        XY_mu = np.column_stack([X, Y_mu])
-        XY_sigma = np.column_stack([X, Y_sigma])
+        Xc_mu, Yc_mu, opt_noise_mu = self._optimize_clustering(X, Y_mu, target_noise)
+        Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, target_noise)
+
+        XYc_mu = np.column_stack([Xc_mu, Yc_mu])
+        XYc_sigma = np.column_stack([Xc_sigma, Yc_sigma])
         
-        # Test values of n_clusters varying from
-        n_points = len(Y_mu)
-        n_clusters_test = (n_points / np.logspace(np.log10(3), 2, 30)).astype(int)
+        # %% ==================================================================
+        # Chunk Data for Processing
+        # =====================================================================
         
-        # inertia = []
-        distances_90p = []
-        for n_clusters in tqdm.tqdm(n_clusters_test, desc='Optimizing Clustering for GP'):
-            # kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(XY_mu)
-            mbkmeans = MiniBatchKMeans(init="k-means++", n_clusters=n_clusters, batch_size=4096,
-                                       n_init="auto", max_no_improvement=50, verbose=0)
-            kmeans = mbkmeans.fit(XY_mu)
-            # inertia.append(kmeans.inertia_)
-            kmeans_distances = []
-            for i in range(kmeans.n_clusters):
-                diff = XY_mu[kmeans.labels_==i,:] - kmeans.cluster_centers_[i]
-                _kmeans_distances = np.linalg.norm(diff, axis=1)
-                kmeans_distances.extend(_kmeans_distances)
-            distances_90p.append(np.percentile(kmeans_distances, 90))
-        
-        # Find the optimized number of clusters to meet our target rel. error
-        # average_inertia = np.array(inertia)/n_points
-        n_clusters_optimized = np.interp(cluster_distance_limit, distances_90p, n_clusters_test).astype(int)
-        cluster_distance_optimized = np.interp(n_clusters_optimized, n_clusters_test[::-1], distances_90p[::-1])
-        # breakpoint()
-        
-        # Cluster data, then create chunks of clusters for optimization
-        kmeans_mu = KMeans(n_clusters=n_clusters_optimized,
-                           random_state=0,
-                           n_init="auto").fit(XY_mu)
-        kmeans_sigma = KMeans(n_clusters=n_clusters_optimized,
-                              random_state=0,
-                              n_init="auto").fit(XY_sigma)
-        XYc_mu = kmeans_mu.cluster_centers_
-        XYc_sigma = kmeans_sigma.cluster_centers_
-        
-        n_chunks = int(np.ceil(n_clusters_optimized/max_chunk_length))
-        
+        n_chunks_mu = np.ceil(XYc_mu.shape[0]/max_chunk_length).astype(int)
         mu_sort = np.argsort(XYc_mu[:,2]) # sort by MJD
-        XYc_mu_chunks = np.array_split(XYc_mu[mu_sort,:], n_chunks)
+        XYc_mu_chunks = np.array_split(XYc_mu[mu_sort,:], n_chunks_mu)
         Xc_mu_chunks = [chunk[:,0:3] for chunk in XYc_mu_chunks]
         Yc_mu_chunks = [chunk[:,3][:,None] for chunk in XYc_mu_chunks]
         
+        n_chunks_sigma = np.ceil(XYc_sigma.shape[0]/max_chunk_length).astype(int)
         sigma_sort = np.argsort(XYc_sigma[:,2]) # sort by MJD
-        XYc_sigma_chunks = np.array_split(XYc_sigma[sigma_sort,:], n_chunks)
+        XYc_sigma_chunks = np.array_split(XYc_sigma[sigma_sort,:], n_chunks_sigma)
         Xc_sigma_chunks = [chunk[:,0:3] for chunk in XYc_sigma_chunks]
         Yc_sigma_chunks = [chunk[:,3][:,None] for chunk in XYc_sigma_chunks]
         
-        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, cluster_distance_optimized)
+        # %% ==================================================================
+        # Run the GP Regression
+        # =====================================================================
+        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, opt_noise_mu)
         
-        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, cluster_distance_optimized)
+        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, opt_noise_sigma)
         
-        # =============================================================================
+        # %% ==================================================================
         # Predict values for the full grid...     
-        # =============================================================================
+        # =====================================================================
         Xlat, Xlon, Xmjd = np.meshgrid(lat_scaler.transform(lat_for3d[:,None]),
                                        lon_scaler.transform(lon_for3d[:,None]), 
                                        mjd_scaler.transform(mjd_for3d[:,None]),
@@ -1284,15 +1225,32 @@ class multihuxt_inputs:
         U_mu_3d = val_mu_mu
         U_sigma_3d = np.sqrt(val_mu_sig**2 + val_sig_mu**2)
         
-        # =============================================================================
-        # Generate the prediction for the clusters, then interpolate out?
-        # =============================================================================
-        
         # Generate an OBVIOUSLY WRONG B
         B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
         
-        print("Check for prediction quality!")
-        breakpoint()
+        # # %% ==================================================================
+        # # TESTING PLOTS
+        # # =====================================================================
+        # print("Check for prediction quality!")
+        # self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d, U_mu_3d, U_sigma_3d, B_3d)
+        # test_atOMNI = self.sample_boundaryDistribution3D(at='omni')
+        # test_atSTA = self.sample_boundaryDistribution3D(at='stereo a')
+        
+        # fig, axs = plt.subplots(nrows=2)
+        # img = axs[0].pcolormesh(test_atOMNI['t_grid'], test_atOMNI['lon_grid'], 
+        #                         test_atOMNI['U_mu_grid'] - self.boundaryDistributions['omni']['U_mu_grid'], 
+        #                         vmin=-100, vmax=100)
+        
+        
+        # img = axs[1].pcolormesh(test_atSTA['t_grid'], test_atSTA['lon_grid'], 
+        #                         test_atSTA['U_mu_grid'] - self.boundaryDistributions['stereo a']['U_mu_grid'], 
+        #                         vmin=-100, vmax=100)
+        
+        # fig.colorbar(img, ax=axs)
+        # plt.show()
+        
+        # %% Return
+        
         # Assign to self
         # Sample at OMNI/STA
         
@@ -1301,38 +1259,24 @@ class multihuxt_inputs:
         # =============================================================================
         # Visualization     
         # =============================================================================
+        self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d, U_mu_3d, U_sigma_3d, B_3d)
         
-        # for source in self.boundarySources:
+        for source in self.boundarySources:
             
-        #     # Reconstruct the backmapped solar wind view at each source
-        #     fig, axs = plt.subplots(nrows=2)
+            # Reconstruct the backmapped solar wind view at each source
+            fig, axs = plt.subplots(nrows=2)
             
-        #     # Get the latitude at each time step
-        #     sampleLat = np.interp(self.boundaryDistributions3D['t_grid'], 
-        #                           self.backgroundDistributions[(source, 'mjd')],
-        #                           self.backgroundDistributions[(source, 'lat_HGI')])
+            axs[0].imshow(self.boundaryDistributions[source]['U_mu_grid'],
+                          vmin=200, vmax=600)
             
-        #     # Get the closest index for each of those latitudes
-        #     sampleLat_indx = np.interp(sampleLat,
-        #                                self.boundaryDistributions3D['lat_grid'],
-        #                                np.arange(len(self.boundaryDistributions3D['lat_grid'])))
-        #     sampleLat_indx = np.round(sampleLat_indx).astype(int)
+            boundary = self.sample_boundaryDistribution3D(source)
+            _ = axs[1].imshow(boundary['U_mu_grid'],
+                              vmin=200, vmax=600)
             
-        #     # Extract the correct latitude indices from the 3D distribution
-        #     U_mu_2d = np.zeros(self.boundaryDistributions3D['U_mu_grid'].shape[1:])
-        #     for i, t in zip(sampleLat_indx, np.arange(0, len(self.boundaryDistributions3D['t_grid']))):
-        #         U_mu_2d[:,t] = self.boundaryDistributions3D['U_mu_grid'][i,:,t]
-                
-        #     axs[0].imshow(self.boundaryDistributions[source]['U_mu_grid'],
-        #                   vmin=200, vmax=600)
+            fig.suptitle(source)
+            # plt.colorbar(_, cax = ax)
             
-        #     _ = axs[1].imshow(U_mu_2d,
-        #                       vmin=200, vmax=600)
-            
-        #     fig.suptitle(source)
-        #     plt.colorbar(_)
-            
-        #     plt.show()
+            plt.show()
                 
             
         # breakpoint()
@@ -1772,9 +1716,165 @@ class multihuxt_inputs:
                 else:
                     metamodel.loc[index, col] = weighted_median
                     
-                breakpoint()
+                # breakpoint()
         
         return metamodel
+    
+    
+    # =========================================================================
+    # Utility Functions 
+    # (that could be separated from this file with no loss of generalization 
+    # or context)
+    # =========================================================================
+    def _optimize_clustering(self, X, Y, target):
+        from sklearn.cluster import MiniBatchKMeans
+        from scipy.optimize import curve_fit
+        from scipy.stats import norm
+        
+        # # Rescale X to better 'compete' with Y
+        # # Here, we do this by setting the scale to the range in standard 
+        # # deviation needed to backout the number of points in X
+        # sigma = np.arange(0.1, 10, 0.1)
+        # population = 1/(1 - (norm.cdf(sigma, 0, 1) - norm.cdf(-sigma, 0, 1)))
+        # x_rescale = np.interp(X.shape[0], population, sigma)*2
+        
+        # # Cluster points by similar independent and dependent values
+        # XY = np.column_stack([X*x_rescale, Y])
+        
+        # # Test values of n_clusters varying from clusters of size 5 to 40
+        # n_points, n_dimensions = XY.shape
+
+        # # potential_n_clusters = (n_points / np.logspace(0, 2, 50)).astype(int)
+        # potential_n_clusters = (n_points / np.linspace(10, 1000, 20)).astype(int)
+        
+        # kmeans_stats = pd.DataFrame(columns=['mean variance', 'max variance'],
+        #                             index=np.unique(potential_n_clusters)[::-1])
+        # for n_clusters in tqdm.tqdm(potential_n_clusters, desc='Optimizing Clustering for GP'):
+        #     mbkmeans = MiniBatchKMeans(init="k-means++", n_clusters=n_clusters, batch_size=2048,
+        #                                n_init="auto", max_no_improvement=10, verbose=0)
+        #     kmeans = mbkmeans.fit(XY)
+            
+        #     # tvpc = total variance per cluster
+        #     tvpc = [(XY[kmeans.labels_ == c].std(axis=0)**2).sum() 
+        #             for c in range(kmeans.n_clusters)]
+            
+        #     kmeans_stats.loc[n_clusters, 'mean variance'] = np.mean(tvpc)
+        #     kmeans_stats.loc[n_clusters, 'max variance'] = np.max(tvpc)
+        
+        # # Which statistic do we care about?
+        # target_var = 'mean variance'
+        
+        # # Fit the trend to get rid of minibatch 'jaggedness'
+        # def trend(x, a, b, c): 
+        #     return a * 1/np.log10(x + b) + c
+        # coeffs, cov = curve_fit(trend, kmeans_stats.index, kmeans_stats[target_var])
+            
+        # # Where does the mean variance equal our target?
+        # if target < kmeans_stats['mean variance'].min():
+        #     target = kmeans_stats['mean variance'].min()
+        # if target > kmeans_stats['mean variance'].max():
+        #     target = kmeans_stats['mean variance'].max()
+        
+        # samples = (n_points / np.linspace(10, 1000, 2000))
+        # optimized_n_clusters = np.interp(target, trend(samples, *coeffs), samples)
+        # optimized_n_clusters = np.round(optimized_n_clusters).astype(int)
+        
+        # # Cluster data, then create chunks of clusters for optimization
+        # kmeans = KMeans(n_clusters=optimized_n_clusters,
+        #                 random_state=0,
+        #                 n_init="auto").fit(XY)
+        
+        # XYc = kmeans.cluster_centers_
+        # Xc = XYc[:, :X.shape[1]]/x_rescale
+        # Yc = XYc[:, X.shape[1]:]
+            
+        
+        # fig, ax = plt.subplots()
+        # for c in range(kmeans.n_clusters):
+        #     ax.scatter(X[kmeans.labels_ == c], Y[kmeans.labels_ == c], marker='o', s=16)
+        #     ax.scatter(Xc[c], Yc[c], marker='x', s=24, color='black')
+        # ax.plot(Xc[np.argsort(Xc, axis=0).flatten()], Yc[np.argsort(Xc, axis=0).flatten()], color='black', ls=':')
+        
+        
+        
+        # =============================================================================
+        # CLUSTER BY JUST X
+        # =============================================================================
+        # Cluster points by similar independent and dependent values
+        XY = np.column_stack([X, Y])
+        
+        # Test values of n_clusters varying from clusters of size 5 to 40
+        n_points, n_dimensions = X.shape
+
+        potential_n_clusters_bounds = [np.log10(n_points), 1000] # Handy lower bound
+        potential_n_clusters = (n_points / np.linspace(*potential_n_clusters_bounds, 100)).astype(int)
+        
+        kmeans_stats = pd.DataFrame(columns=['mean variance', 'max variance'],
+                                    index=np.unique(potential_n_clusters)[::-1])
+        for n_clusters in tqdm.tqdm(kmeans_stats.index, desc='Optimizing Clustering for GP'):
+            mbkmeans = MiniBatchKMeans(init="k-means++", n_clusters=n_clusters, batch_size=2048,
+                                       n_init="auto", max_no_improvement=10, verbose=0)
+            kmeans = mbkmeans.fit(X)
+            
+            # tvpc = total variance per cluster
+            tvpc = [(XY[kmeans.labels_ == c].std(axis=0)**2).sum() 
+                    for c in range(kmeans.n_clusters)]
+            
+            kmeans_stats.loc[n_clusters, 'mean variance'] = np.mean(tvpc)
+            kmeans_stats.loc[n_clusters, 'max variance'] = np.max(tvpc)
+        
+        # Which statistic do we care about?
+        target_var = 'mean variance'
+        kmeans_stats = kmeans_stats.dropna(axis = 'index')
+        
+        # Fit the trend to get rid of minibatch 'jaggedness'
+        # def trend(x, a, b, c): 
+        #     return a * 1/np.log10(x + b) + c
+        def loglog_trend(x, a, b):
+            return a * x + b
+        coeffs, cov = curve_fit(loglog_trend, 
+                                np.log10(kmeans_stats.index), 
+                                np.log10(kmeans_stats[target_var].to_numpy('float64')))
+            
+        # # Where does the mean variance equal our target?
+        # if target < kmeans_stats[target_var].min():
+        #     target = kmeans_stats[target_var].min()
+        # if target > kmeans_stats[target_var].max():
+        #     target = kmeans_stats[target_var].max()
+        
+        trend_x = (n_points / np.linspace(2, X.shape[0], 2000))
+        trend_y = 10**loglog_trend(np.log10(trend_x), *coeffs)
+        
+        # By definition, this curve goes to 0 (well, NaN...) at n_points
+        trend_x = np.insert(trend_x, 0, n_points)
+        trend_y = np.insert(trend_y, 0, 0)
+        
+        fig, ax = plt.subplots()
+        ax.scatter(kmeans_stats.index, kmeans_stats[target_var])
+        ax.plot(trend_x, trend_y, color='black')
+        
+        optimized_n_clusters = np.interp(target, trend_y, trend_x).astype(int)
+        # optimized_n_clusters = 10**np.round(optimized_n_clusters).astype(int)
+        
+        # Cluster data, then create chunks of clusters for optimization
+        kmeans = KMeans(n_clusters=optimized_n_clusters,
+                        random_state=0,
+                        n_init="auto").fit(X)
+        
+        Xc = kmeans.cluster_centers_
+        Yc_list = [Y[kmeans.labels_ == c].mean(axis=0) 
+                   for c in range(kmeans.n_clusters)]
+        Yc = np.array(Yc_list)
+            
+        
+        # fig, ax = plt.subplots()
+        # for c in range(kmeans.n_clusters):
+        #     ax.scatter(X[kmeans.labels_ == c], Y[kmeans.labels_ == c], marker='o', s=16)
+        #     ax.scatter(Xc[c], Yc[c], marker='x', s=24, color='black')
+        # ax.plot(Xc[np.argsort(Xc, axis=0).flatten()], Yc[np.argsort(Xc, axis=0).flatten()], color='black', ls=':')
+        # plt.show()
+        
+        return Xc, Yc, target
     
 
 # Define an inner function to be run in parallel
@@ -1800,6 +1900,12 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, ephe
                                                      innerbound)
     return vcarr_inner
 
+
+
+
+
+
+
 # %%
 import gpflow
 import tensorflow as tf
@@ -1810,13 +1916,14 @@ from sklearn.cluster import KMeans
 import multiprocessing as mp
 from joblib import Parallel, delayed
 class GPFlowEnsemble:
-    def __init__(self, kernel, X_list, Y_list, noise_variance):
+    def __init__(self, kernel, X_list, Y_list, noise_variance, weight_scaling=100):
     
         # Given variables
         self.kernel = kernel
         self.X_list = X_list
         self.Y_list = Y_list
         self.noise_variance = noise_variance
+        self.weight_scaling = weight_scaling
         
         # Derived variables
         self.nChunks = len(X_list)
@@ -1922,11 +2029,11 @@ class GPFlowEnsemble:
         
             results = list(tqdm.tqdm(generator, total=len(X_new_chunked)))
         else:
-            results = _predict_f(self, X_new)
+            results = [_predict_f(self, X_new)]
         
         results_mu = np.vstack([r[0] for r in results])
         results_sigma2 = np.vstack([r[1] for r in results])
-
+        
         return results_mu, results_sigma2
     
     # def predict_f_samples(self, X_new, num_samples=1):
@@ -1989,7 +2096,7 @@ class GPFlowEnsemble:
         
             results = list(tqdm.tqdm(generator, total=len(X_new_chunked)))
         else:
-            results = _predict_f_samples(self, X_new)
+            results = [_predict_f_samples(self, X_new)]
         
         results = np.concatenate(results, axis=1)
         
@@ -2038,7 +2145,7 @@ class GPFlowEnsemble:
         
             results = list(tqdm.tqdm(generator, total=len(X_new_chunked)))
         else:
-            results = _predict_y(self, X_new)
+            results = [_predict_y(self, X_new)]
         
         results_mu = np.vstack([r[0] for r in results])
         results_sigma2 = np.vstack([r[1] for r in results])
@@ -2073,10 +2180,7 @@ class GPFlowEnsemble:
         norm_min_distances = min_distances / (1/len(self.X_list))
         norm_min_distances[norm_min_distances > 1] = 1
         
-        weights = scipy.special.softmax(100*(1-norm_min_distances), axis=0)
-        
-        # breakpoint()
-        
+        weights = scipy.special.softmax(self.weight_scaling*(1-norm_min_distances), axis=0)
         
         return weights
     
@@ -2084,6 +2188,7 @@ class GPFlowEnsemble:
         import gpflow
         for model in self.model_list:
             gpflow.utilities.print_summary(model, 'simple')
+        breakpoint()
 
 # def _process_sample(df_sample, method_sample):
 #     sf_sample_copy = df_sample.copy(deep=True)
