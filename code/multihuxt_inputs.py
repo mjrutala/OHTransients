@@ -944,7 +944,7 @@ class multihuxt_inputs:
         
         return
     
-    def generate_boundaryDistribution3D(self, nLat=16, extend=None, GP=True, num_samples=0, target_noise=0.10):
+    def generate_boundaryDistribution3D(self, nLat=16, extend=None, GP=True, num_samples=0, target_noise=0.10, max_chunk_length=1024):
         
         # Get dimensions from OMNI boundary distribution, which *must* exist
         nLon, nTime = self.boundaryDistributions['omni']['U_mu_grid'].shape
@@ -961,7 +961,10 @@ class multihuxt_inputs:
         if type(extend) == str:
             U_mu_3d, U_sigma_3d, B_3d = self._extend_boundaryDistributions(nLat, extend)
         elif GP is True:
-            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d, num_samples=num_samples, target_noise=target_noise)
+            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d, 
+                                                                           num_samples=num_samples, 
+                                                                           target_noise=target_noise, 
+                                                                           max_chunk_length=max_chunk_length)
             
         self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d,
                                              U_mu_3d, U_sigma_3d, B_3d)
@@ -1125,12 +1128,13 @@ class multihuxt_inputs:
         mjd_scale_max = 6 * 25.38 * mjd_scaler.scale_
         # if mjd_scale_mid > 0.9: mjd_scale_mid[0] = 0.9
         # if mjd_scale_max > 1.0: mjd_scale_max[0] = 1.0
-        mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
-           transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
+        # mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
+        #    transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
+        mjd_lengthscale = gpflow.Parameter(mjd_scale_mid)
         
         lon_scale_min = np.float64(0.0)
         lon_scale_mid = np.float64(0.5)
-        lon_scale_max = np.float64(10.0)
+        lon_scale_max = np.float64(1.0)
         lon_lengthscale = gpflow.Parameter(lon_scale_mid, 
            transform = tfp.bijectors.SoftClip(lon_scale_min, lon_scale_max))
         
@@ -1956,10 +1960,11 @@ class GPFlowEnsemble:
             
             self.model_list.append(model)
             
+            if i == 0: first_kernel_iter = copy.deepcopy(self.kernel)
+            
             print("Completed in {:.1f} s".format(time.time() - t1))
             
         print("All GP models optimized in {:.1f} s".format(time.time() - t0))
-        
         return
     
     # def predict_f(self, X_new):
@@ -2188,7 +2193,15 @@ class GPFlowEnsemble:
         import gpflow
         for model in self.model_list:
             gpflow.utilities.print_summary(model, 'simple')
-        breakpoint()
+            
+        df = pd.DataFrame()
+        for i, model in enumerate(self.model_list):
+            d = gpflow.utilities.parameter_dict(model)
+            
+            for key, value in d.items():
+                df.loc[i, key] = value.numpy()
+            
+        return df
 
 # def _process_sample(df_sample, method_sample):
 #     sf_sample_copy = df_sample.copy(deep=True)
