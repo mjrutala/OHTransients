@@ -95,15 +95,21 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     end_str = "&endDate=" +  end.strftime("%Y-%m-%d")
     location_str = "&location=" + location.replace(' ', '%20') #no space in URL
     url = baseurl + start_str + end_str + location_str
-    
+   
     # Check for a response and get the data
-    response = requests.get(url)
-    if response.status_code != 200:
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print('cannot successfully get an http response')
+        # read the data
+        print("Getting data from", url)
+        df = pd.read_json(url)
+    except:
         print('cannot successfully get an http response')
-        
-    # read the data
-    print("Getting data from", url)
-    df = pd.read_json(url)
+        df = pd.DataFrame(columns=['catalog', 'activityID', 'location', 
+                                   'eventTime', 'submissionTime',
+                                   'versionId', 'link', 'instruments', 
+                                   'linkedEvents', 'sentNotifications'])
     
     # If df is length 0, create a dummy df with same columns
     if len(df) == 0:
@@ -117,7 +123,8 @@ def ICME(start, end, location='Earth', duration=1.5*u.day, ensureCME=True):
     try: 
         df['eventTime'] = [strptime(t, time_fmt) for t in df['eventTime'].to_list()]
     except:
-        breakpoint()
+        # breakpoint()
+        pass
     
     for index, row in df.iterrows():
         # Flatten the instrument names
