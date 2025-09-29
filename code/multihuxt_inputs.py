@@ -927,10 +927,16 @@ class multihuxt_inputs:
                                                'U_sig_grid': vcarr_sig,
                                                'B_grid': bcarr}
             
-            # !!!! For completeness, add boundarySamples here
+            # For completeness, add boundarySamples here
             boundarySamples_d[source] = []
+            for result in results:
+                boundarySamples_d[source].append({'t_grid': t,
+                                                  'lon_grid': lons, 
+                                                  'U_grid': result,
+                                                  'B_grid': bcarr})
         
         self.boundaryDistributions = boundaryDistributions_d
+        self.boundarySamples = boundarySamples_d
         
         # # =============================================================================
         # # Visualization 
