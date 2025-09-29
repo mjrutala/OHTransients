@@ -52,7 +52,8 @@ except:
 # %%
 import tensorflow_probability  as     tfp
 class multihuxt_inputs:
-    def __init__(self, start, stop, rmax=1, latmax=10):
+    def __init__(self, start, stop, 
+                 rmax=1, latmax=10):
         self.start = start
         self.stop = stop
         self.radmax = rmax * u.AU
@@ -62,6 +63,13 @@ class multihuxt_inputs:
         self.usw_minimum = 200 * u.km/u.s
         self.SiderealCarringtonRotation = 27.28 * u.day
         self.SynodicCarringtonRotation = 25.38 * u.day
+        
+        # These keywords can only be set AFTER object initialization
+        
+        # ICME parameters
+        self._icme_duration = 4.0 * u.day # conservative duration (Richardson & Cane 2010)
+        self._icme_duration_buffer = 1.0 * u.day # conservative buffer (Richardson & Cane 2010)
+        self._icme_interp_buffer = 1.0 * u.day
         
         # Required initializations
         # Other methods check that these are None (or have value) before 
@@ -229,9 +237,7 @@ class multihuxt_inputs:
     #         print('</html>', file=f)
     #     return
     
-    def get_availableTransientData(self, sources=None, duration=2):
-        
-        duration = duration * u.day
+    def get_availableTransientData(self, sources=None):
         
         location_aliases = {'omni': 'Earth',
                             'stereo a': 'STEREO%20A',
@@ -258,7 +264,7 @@ class multihuxt_inputs:
             icmes = queryDONKI.ICME(self.simstart, 
                                     self.simstop, 
                                     location = location, 
-                                    duration = duration,
+                                    duration = self._icme_duration,
                                     ensureCME = True) 
 
             icmes['affiliated_source'] = source
@@ -275,12 +281,7 @@ class multihuxt_inputs:
         
         return
     
-    def get_indexICME(self, source, 
-                      icme_buffer=0.5, 
-                      interp_buffer=1.0):
-        
-        icme_buffer *= u.day
-        interp_buffer *= u.day
+    def get_indexICME(self, source):
         
         # Get the insitu data + mjd at this source
         insitu = self.availableBackgroundData[source].copy()
@@ -302,8 +303,8 @@ class multihuxt_inputs:
             insitu_noicme = Hin.remove_ICMEs(insitu, icmes, 
                                              params=['U'], 
                                              interpolate = False, 
-                                             icme_buffer = icme_buffer, 
-                                             interp_buffer = interp_buffer, 
+                                             icme_buffer = self._icme_duration_buffer, 
+                                             interp_buffer = self._icme_interp_buffer, 
                                              fill_vals = np.nan)
         else:
             insitu_noicme = insitu
@@ -342,9 +343,7 @@ class multihuxt_inputs:
                                          GP = False, extend = False,
                                          target_noise = 1e-2,
                                          max_chunk_length = 1024,
-                                         num_samples = 0,
-                                         icme_buffer = 0.5,
-                                         interp_buffer = 1.0):
+                                         num_samples = 0):
         target_variables = ['U']
         
         # # Calculate the span from stop - start
@@ -362,7 +361,7 @@ class multihuxt_inputs:
             
             # If indexICME is not supplied, look it up
             if ICME_df is None:
-                indexICME = self.get_indexICME(source, icme_buffer=icme_buffer, interp_buffer=interp_buffer)
+                indexICME = self.get_indexICME(source)
             else:
                 indexICME = ICME_df[source]
             
@@ -502,6 +501,16 @@ class multihuxt_inputs:
         plt.show()
         
         return
+    
+    def _extend_backgroundDistributions(self, df,
+                                        target_variables = ['U', 'Br'],
+                                        noise_constant = 0.0,
+                                        num_samples = 0):
+        
+        print("_extend_backgroundDistributions has not yet been implemented!")
+        breakpoint()
+        
+        return backgroundDistribution_df, backgroundSamples
     
     def _impute_backgroundDistributions(self, df, carrington_period,
                                         target_variables = ['U', 'Br'],
