@@ -342,7 +342,9 @@ class multihuxt_inputs:
                                          GP = False, extend = False,
                                          target_noise = 1e-2,
                                          max_chunk_length = 1024,
-                                         num_samples = 0,):
+                                         num_samples = 0,
+                                         icme_buffer = 0.5,
+                                         interp_buffer = 1.0):
         target_variables = ['U']
         
         # # Calculate the span from stop - start
@@ -360,7 +362,7 @@ class multihuxt_inputs:
             
             # If indexICME is not supplied, look it up
             if ICME_df is None:
-                indexICME = self.get_indexICME(source)
+                indexICME = self.get_indexICME(source, icme_buffer=icme_buffer, interp_buffer=interp_buffer)
             else:
                 indexICME = ICME_df[source]
             
@@ -1059,22 +1061,26 @@ class multihuxt_inputs:
             ('log_transform', FunctionTransformer(np.log1p, inverse_func=np.expm1, check_inverse=False)),
             ('scaler', StandardScaler()),
             ])
-
+        
         #
         lat, lon, mjd, val_mu, val_sigma, = [], [], [], [], []
         for source in self.boundarySources:
             
-            lon_1d = self.boundaryDistributions[source]['lon_grid']
-            mjd_1d = self.boundaryDistributions[source]['t_grid']
+            bound = self._rescale_2DBoundary(self.boundaryDistributions[source],
+                                             target_reduction = kwargs.get('target_reduction'),
+                                             target_size = kwargs.get('target_size'))
+            
+            lon_1d = bound['lon_grid']
+            mjd_1d = bound['t_grid']
             lat_1d = np.interp(mjd_1d, 
                                self.ephemeris[source].time.mjd, 
                                self.ephemeris[source].lat_c.to(u.deg).value)
             
             mjd_2d, lon_2d, = np.meshgrid(mjd_1d, lon_1d)
-            lat_2d = np.tile(lat_1d, (nLon, 1))
+            lat_2d, lon_2d, = np.meshgrid(lat_1d, lon_1d)
             
-            val_mu_2d = self.boundaryDistributions[source]['U_mu_grid']
-            val_sigma_2d = self.boundaryDistributions[source]['U_sig_grid']
+            val_mu_2d = bound['U_mu_grid']
+            val_sigma_2d = bound['U_sig_grid']
             
             
             # We're going to transpose all of these 2D matrices
@@ -1090,7 +1096,7 @@ class multihuxt_inputs:
             # sample from val sample, rather than val mu?
             # val.extend(rng.normal(loc=val_mu_2d.flatten(), 
             #                       scale=val_sigma_2d.flatten()))
-            
+          
         # Recast as arrays
         lon = np.array(lon)
         lat = np.array(lat)
@@ -1165,21 +1171,24 @@ class multihuxt_inputs:
         Y_mu = yval_mu
         Y_sigma = yval_sigma
         
-        Xc_mu, Yc_mu, opt_noise_mu = self._optimize_clustering(X, Y_mu, **kwargs)
-        # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, 
-        #     target_reduction=target_reduction, target_noise=target_noise, inX=True)
-        Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, **kwargs)
+        # Xc_mu, Yc_mu, opt_noise_mu = self._optimize_clustering(X, Y_mu, **kwargs)
+        # # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, 
+        # #     target_reduction=target_reduction, target_noise=target_noise, inX=True)
+        # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, **kwargs)
 
-        XYc_mu = np.column_stack([Xc_mu, Yc_mu])
-        XYc_sigma = np.column_stack([Xc_sigma, Yc_sigma])
+        # XYc_mu = np.column_stack([Xc_mu, Yc_mu])
+        # XYc_sigma = np.column_stack([Xc_sigma, Yc_sigma])
+        
+        opt_noise_mu = 0.05
+        opt_noise_sigma = 0.05
 
         # %% ==================================================================
         # Chunk Data for Processing
         # =====================================================================
         
-        Xc_mu_chunks, Yc_mu_chunks = self._optimize_chunking(Xc_mu, Yc_mu, **kwargs)
+        Xc_mu_chunks, Yc_mu_chunks = self._optimize_chunking(X, Y_mu, **kwargs)
         
-        Xc_sigma_chunks, Yc_sigma_chunks = self._optimize_chunking(Xc_sigma, Yc_sigma, **kwargs)
+        Xc_sigma_chunks, Yc_sigma_chunks = self._optimize_chunking(X, Y_sigma, **kwargs)
         
         
         fig, axs = plt.subplots(ncols=len(Xc_mu_chunks), figsize=[10,5], subplot_kw={'projection': '3d'})
@@ -1354,7 +1363,7 @@ class multihuxt_inputs:
         interp_sigma = RegularGridInterpolator((self.boundaryDistributions3D['lat_grid'], 
                                              self.boundaryDistributions3D['lon_grid'], 
                                              self.boundaryDistributions3D['t_grid']), 
-                                            self.boundaryDistributions3D['U_mu_grid'])
+                                            self.boundaryDistributions3D['U_sig_grid'])
         
         U_sigma_2d = interp_sigma(np.column_stack((lat2d.flatten(), lon2d.flatten(), t2d.flatten()))).reshape(lon2d.shape)
         
@@ -1777,6 +1786,40 @@ class multihuxt_inputs:
         return metamodel
     
     
+    def _rescale_2DBoundary(self, bound, target_reduction=None, target_size=None):
+        from scipy import ndimage
+        from skimage.transform import rescale
+        from skimage.measure import block_reduce
+        
+        data_shape = bound['U_mu_grid'].shape
+        
+        if target_reduction is None and target_size is None:
+            target_reduction = 0.25
+        elif target_reduction is not None:
+            zoom_scale = np.sqrt(target_reduction)
+        else:
+            zoom_scale = np.sqrt(target_size/np.product(data_shape))
+        
+        new_bound = {}
+        for key, val in bound.items():
+            
+            # Create a mask for valid (non-NaN) pixels
+            mask = ~np.isnan(val)
+            val_clean = np.where(mask, val, 0.0)
+            
+            # Resize both image and mask
+            val_rescaled = rescale(val_clean, zoom_scale, 
+                                  anti_aliasing=True, preserve_range=True)
+            mask_rescaled = rescale(mask.astype(float), zoom_scale, 
+                                  anti_aliasing=True, preserve_range=True)
+            
+            new_val = val_rescaled/mask_rescaled
+            new_val[~mask_rescaled.astype(bool)] = np.nan
+                
+            new_bound[key] = new_val
+            
+        return new_bound
+                                         
     # =========================================================================
     # Utility Functions 
     # (that could be separated from this file with no loss of generalization 
