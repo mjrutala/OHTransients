@@ -1059,16 +1059,17 @@ class multihuxt_inputs:
         nLon = len(lon_for3d)
         nMjd = len(mjd_for3d)
         
-        # Setup Normalizations ahead of time
-        lat_scaler = MinMaxScaler((-1,1))
+        # Setup normalizations ahead of time
+        # Normalizations are error-normalized to prevent issues in matrix decomposition
+        lat_scaler = StandardScaler() # MinMaxScaler((-1,1))
         lat_scaler.fit(lat_for3d[:,None])
         
-        lon_scaler = MinMaxScaler((-1,1))
+        lon_scaler = StandardScaler() # MinMaxScaler((-1,1))
         lon_scaler.fit(lon_for3d[:,None])
         
-        mjd_scaler = MinMaxScaler((-1,1))
+        mjd_scaler = StandardScaler() # MinMaxScaler((-1,1))
         mjd_scaler.fit(mjd_for3d[:,None])
-
+        
         # Initialize value scalers for mean (mu) and standard deviation (sigma)
         val_mu_scaler = StandardScaler()
 
@@ -1079,11 +1080,18 @@ class multihuxt_inputs:
         
         #
         lat, lon, mjd, val_mu, val_sigma, = [], [], [], [], []
+        val_mu_noise_variance = []
+        val_sigma_noise_variance = []
         for source in self.boundarySources:
             
-            bound = self._rescale_2DBoundary(self.boundaryDistributions[source],
-                                             target_reduction = kwargs.get('target_reduction'),
-                                             target_size = kwargs.get('target_size'))
+            bound, noise_variance = self._rescale_2DBoundary(
+                self.boundaryDistributions[source],
+                target_reduction = kwargs.get('target_reduction'),
+                target_size = kwargs.get('target_size')
+                )
+            
+            val_mu_noise_variance.append(noise_variance['U_mu_grid'])
+            val_sigma_noise_variance.append(noise_variance['U_sig_grid'])
             
             lon_1d = bound['lon_grid']
             mjd_1d = bound['t_grid']
@@ -1096,7 +1104,6 @@ class multihuxt_inputs:
             
             val_mu_2d = bound['U_mu_grid']
             val_sigma_2d = bound['U_sig_grid']
-            
             
             # We're going to transpose all of these 2D matrices
             # So, when flattened, lon is the second (faster changing) dim
@@ -1136,24 +1143,24 @@ class multihuxt_inputs:
         # GP Kernel Definitions
         # =====================================================================
         
-        # lat_scale_min = 0 * lat_scaler.scale_
+        lat_scale_min = 0 * lat_scaler.scale_
         lat_scale_mid = 1 * lat_scaler.scale_
-        # lat_scale_max = 3 * lat_scaler.scale_
-        # lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
-        #    transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
-        lat_lengthscale = gpflow.Parameter(lat_scale_mid)
+        lat_scale_max = 3 * lat_scaler.scale_
+        lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
+           transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
+        # lat_lengthscale = gpflow.Parameter(lat_scale_mid)
         
-        # mjd_scale_min = 0.0
+        mjd_scale_min = 0.0
         mjd_scale_mid = 3 * 25.38 * mjd_scaler.scale_
-        # mjd_scale_max = 6 * 25.38 * mjd_scaler.scale_
+        mjd_scale_max = 6 * 25.38 * mjd_scaler.scale_
         # if mjd_scale_mid > 0.9: mjd_scale_mid[0] = 0.9
         # if mjd_scale_max > 1.0: mjd_scale_max[0] = 1.0
-        # mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
-        #    transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
-        mjd_lengthscale = gpflow.Parameter(mjd_scale_mid)
+        mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
+           transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
+        # mjd_lengthscale = gpflow.Parameter(mjd_scale_mid)
         
         # lon_scale_min = np.float64(0.0)
-        lon_scale_mid = np.float64(0.5)
+        lon_scale_mid = np.float64(1.0)
         # lon_scale_max = np.float64(1.0)
         # lon_lengthscale = gpflow.Parameter(lon_scale_mid, 
         #    transform = tfp.bijectors.SoftClip(lon_scale_min, lon_scale_max))
@@ -1165,7 +1172,8 @@ class multihuxt_inputs:
         base_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
         amplitude_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
         period_kernel = gpflow.kernels.Periodic(
-            gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
+            # gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
+            gpflow.kernels.SquaredExponential(active_dims=[1]), 
             period=period_gp)
         lon_kernel = base_kernel + amplitude_kernel * period_kernel
                      
@@ -1194,8 +1202,9 @@ class multihuxt_inputs:
         # XYc_mu = np.column_stack([Xc_mu, Yc_mu])
         # XYc_sigma = np.column_stack([Xc_sigma, Yc_sigma])
         
-        opt_noise_mu = 0.05
-        opt_noise_sigma = 0.05
+        # Generous estimate; in general, the downsampling does not introduce substantial noise
+        opt_noise_mu = 0.005
+        opt_noise_sigma = 0.005
 
         # %% ==================================================================
         # Chunk Data for Processing
@@ -1287,6 +1296,8 @@ class multihuxt_inputs:
         # !!!! Eventually, val will apply to both U and B...
         U_mu_3d = val_mu_mu
         U_sigma_3d = np.sqrt(val_mu_sig**2 + val_sig_mu**2)
+        
+        breakpoint()
         
         # Generate an OBVIOUSLY WRONG B
         B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
@@ -1805,6 +1816,7 @@ class multihuxt_inputs:
         from scipy import ndimage
         from skimage.transform import rescale
         from skimage.measure import block_reduce
+        from scipy.interpolate import RegularGridInterpolator
         
         data_shape = bound['U_mu_grid'].shape
         
@@ -1832,8 +1844,24 @@ class multihuxt_inputs:
             new_val[~mask_rescaled.astype(bool)] = np.nan
                 
             new_bound[key] = new_val
+        
+        
+        # Estimate noise 
+        noise_variance = {}
+        for key, val in new_bound.items():
+            if len(val.shape) == 2:
+                interp = RegularGridInterpolator(
+                    (new_bound['lon_grid'], new_bound['t_grid']), 
+                    val,
+                    bounds_error=False)
             
-        return new_bound
+                lon2d, t2d = np.meshgrid(bound['lon_grid'], bound['t_grid'], indexing='ij')
+                upscaled = interp(np.column_stack([lon2d.flatten(), t2d.flatten()])).reshape(lon2d.shape)
+                difference = upscaled - bound[key]
+                
+                noise_variance[key] = np.nanpercentile(difference, 95)
+        
+        return new_bound, noise_variance
                                          
     # =========================================================================
     # Utility Functions 
