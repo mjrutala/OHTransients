@@ -715,7 +715,7 @@ class multihuxt_inputs:
             
         return gp_variables
         
-    def generate_boundaryDistributions(self, constant_sig=0):
+    def generate_boundaryDistributions(self, constant_percent_error=0.0):
         from tqdm import tqdm
         # from dask.distributed import Client, as_completed, LocalCluster
         import multiprocessing as mp
@@ -758,23 +758,17 @@ class multihuxt_inputs:
                 delayed(func)(self.simstart, self.simstop, source, df_sample, method_sample, self.ephemeris[source], self.innerbound)
                 for df_sample, method_sample in zip(dfSamples, methodSamples))
             
-            results = list(tqdm(funcGenerator, total=len(dfSamples)))
+            result_tuples = list(tqdm(funcGenerator, total=len(dfSamples)))
             
-            # uSamples = [rng.normal(loc=insitu_df['U_mu'], 
-            #                        scale=insitu_df['U_sig']
-            #                        ) for _ in range(nSamples)]
+            vcarr_results = [result_tuple[0] for result_tuple in result_tuples]
+            bcarr_results = [result_tuple[1] for result_tuple in result_tuples]
             
-            # methodSamples = rng.choice(methodOptions, nSamples)
-            
-            # vcarrGenerator = Parallel(return_as='generator', n_jobs=nCores, background='threading')(
-            #     delayed(process_sample)(u, method) 
-            #     for u, method in zip(uSamples, methodSamples)
-            #     )
-            # vcarrSamples = list(tqdm(vcarrGenerator, total=nSamples))
-            breakpoint()
             # Characterize the resulting samples as one distribution
-            vcarr_mu = np.nanmean(results, axis=0)
-            vcarr_sig = np.sqrt(np.nanstd(results, axis=0)**2 + constant_sig**2)
+            vcarr_mu = np.nanmean(vcarr_results, axis=0)
+            vcarr_sig = np.sqrt(np.nanstd(vcarr_results, axis=0)**2 + (vcarr_mu * constant_percent_error)**2)
+            
+            bcarr_mu = np.nanmean(bcarr_results, axis=0)
+            bcarr_sig = np.sqrt(np.nanstd(bcarr_results, axis=0)**2 + (bcarr_mu * constant_percent_error)**2)
             
             # Get the left edges of longitude bins
             lons = np.linspace(0, 360, vcarr_mu.shape[0]+1)[:-1]
@@ -782,16 +776,17 @@ class multihuxt_inputs:
             boundaryDistributions_d[source] = {'t_grid': t,
                                                'lon_grid': lons, 
                                                'U_mu_grid': vcarr_mu,
-                                               'U_sig_grid': vcarr_sig,
-                                               'B_grid': bcarr}
+                                               'U_sigma_grid': vcarr_sig,
+                                               'Br_mu_grid': bcarr_mu,
+                                               'Br_sigma_grid': bcarr_sig}
             
             # For completeness, add boundarySamples here
             boundarySamples_d[source] = []
-            for result in results:
+            for result_tuple in result_tuples:
                 boundarySamples_d[source].append({'t_grid': t,
                                                   'lon_grid': lons, 
-                                                  'U_grid': result,
-                                                  'B_grid': bcarr})
+                                                  'U_grid': result_tuple[0],
+                                                  'B_grid': result_tuple[1]})
         
         self.boundaryDistributions = boundaryDistributions_d
         self.boundarySamples = boundarySamples_d
@@ -1895,14 +1890,17 @@ def _map_vBoundaryInwards(simstart, simstop, source, insitu_df, corot_type, ephe
     bcarr_inner = bcarr.copy()
     for i, _ in enumerate(t):
         current_r = np.interp(t[i], ephemeris.time.mjd, ephemeris.r)
-        vcarr_inner[:,i], bcarr_inner[:,i] = Hin.map_v_boundary_inwards(
+        results = Hin.map_v_boundary_inwards(
             vcarr[:,i]*u.km/u.s, 
             current_r.to(u.solRad),
             innerbound,
             b_orig = bcarr[:,i]
             )
         
-    return vcarr_inner
+        vcarr_inner[:,i] = results[0]
+        bcarr_inner[:,i] = results[1]
+        
+    return vcarr_inner, bcarr_inner
 
 
 
