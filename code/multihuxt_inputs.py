@@ -835,16 +835,27 @@ class multihuxt_inputs:
             print("Cannot have extend=str and GP=True!")
             return
         if type(extend) == str:
-            U_mu_3d, U_sigma_3d, B_3d = self._extend_boundaryDistributions(nLat, extend)
-        elif GP is True:
-            U_mu_3d, U_sigma_3d, B_3d = self._impute_boundaryDistributions(lat_for3d, lon_for3d, mjd_for3d, num_samples=num_samples, **kwargs)
+            summary = self._extend_boundaryDistributions(nLat, extend)
             
-        self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d,
-                                             U_mu_3d, U_sigma_3d, B_3d)
-        
+            self._assign_boundaryDistributions3D(
+                mjd_for3d, lon_for3d, lat_for3d,
+                summary['U_mu'], summary['U_sigma'], summary['Br_mu'], summary['Br_sigma'])
+            self._boundaryScalers = {}
+            self._boundaryModels = {}
+            
+        elif GP is True:
+            summary, scalers, models = self._impute_boundaryDistributions(
+                lat_for3d, lon_for3d, mjd_for3d, num_samples=num_samples, **kwargs)
+            
+            self._assign_boundaryDistributions3D(
+                mjd_for3d, lon_for3d, lat_for3d,
+                summary['U_mu'], summary['U_sigma'], summary['Br_mu'], summary['Br_sigma'])
+            self._boundaryScalers = scalers
+            self._boundaryModels = models
+            
         return
     
-    def _assign_boundaryDistributions3D(self, t_grid, lon_grid, lat_grid, U_mu_grid, U_sig_grid, B_grid):
+    def _assign_boundaryDistributions3D(self, t_grid, lon_grid, lat_grid, U_mu_grid, U_sig_grid, Br_mu_grid, Br_sig_grid):
         """
         This method is independent of generate_boundaryDistributions3D to allow
         assignment to attribute within the _extend and _impute methods, and 
@@ -874,20 +885,29 @@ class multihuxt_inputs:
                                         'lon_grid': lon_grid,
                                         'lat_grid': lat_grid,
                                         'U_mu_grid': U_mu_grid,
-                                        'U_sig_grid': U_sig_grid,
-                                        'B_grid': B_grid,
+                                        'U_sigma_grid': U_sig_grid,
+                                        'Br_mu_grid': Br_mu_grid,
+                                        'Br_sigma_grid': Br_sig_grid,
                                         }
         
     def _extend_boundaryDistributions(self, nLat, name):
         
         U_mu_3d = np.tile(self.boundaryDistributions[name]['U_mu_grid'], 
                           (nLat, 1, 1))
-        U_sigma_3d = np.tile(self.boundaryDistributions[name]['U_sig_grid'], 
+        U_sigma_3d = np.tile(self.boundaryDistributions[name]['U_sigma_grid'], 
                           (nLat, 1, 1))
-        B_3d = np.tile(self.boundaryDistributions[name]['B_grid'], 
+        # B_3d = np.tile(self.boundaryDistributions[name]['B_grid'], 
+        #                   (nLat, 1, 1))
+        Br_mu_3d = np.tile(self.boundaryDistributions[name]['Br_mu_grid'], 
+                          (nLat, 1, 1))
+        Br_sigma_3d = np.tile(self.boundaryDistributions[name]['Br_sigma_grid'], 
                           (nLat, 1, 1))
         
-        return U_mu_3d, U_sigma_3d, B_3d
+        summaries = {'U_mu': U_mu_3d, 
+                     'U_sigma': U_sigma_3d,
+                     'Br_mu': Br_mu_3d,
+                     'Br_sigma': Br_sigma_3d}
+        return summaries
     
     def _interpolate_boundaryDistributions(self, lat_for3d, lon_for3d, mjd_for3d):
         
@@ -912,6 +932,11 @@ class multihuxt_inputs:
         nLon = len(lon_for3d)
         nMjd = len(mjd_for3d)
         
+        all_summaries = {}
+        all_samples = {}
+        all_scalers = {}
+        all_models = {}
+        
         # Setup normalizations ahead of time
         # Normalizations are error-normalized to prevent issues in matrix decomposition
         lat_scaler = StandardScaler() # MinMaxScaler((-1,1))
@@ -923,237 +948,252 @@ class multihuxt_inputs:
         mjd_scaler = StandardScaler() # MinMaxScaler((-1,1))
         mjd_scaler.fit(mjd_for3d[:,None])
         
-        # Initialize value scalers for mean (mu) and standard deviation (sigma)
-        val_mu_scaler = StandardScaler()
+        # Assign these dependent variables to all_scalers
+        all_scalers.update({'lat_grid': lat_scaler, 'lon_grid': lon_scaler, 't_grid': mjd_scaler})
+        
+        # Extract variables and fit dependent 
+        for target_var in ['U', 'Br']:
+            
+            # Initialize value scalers for mean (mu) and standard deviation (sigma)
+            val_mu_scaler = StandardScaler()
 
-        val_sigma_scaler = Pipeline([
-            ('log_transform', FunctionTransformer(np.log1p, inverse_func=np.expm1, check_inverse=False)),
-            ('scaler', StandardScaler()),
-            ])
-        
-        #
-        lat, lon, mjd, val_mu, val_sigma, = [], [], [], [], []
-        val_mu_noise_variance = []
-        val_sigma_noise_variance = []
-        for source in self.boundarySources:
+            val_sigma_scaler = Pipeline([
+                ('log_transform', FunctionTransformer(np.log1p, inverse_func=np.expm1, check_inverse=False)),
+                ('scaler', StandardScaler()),
+                ])
             
-            bound, noise_variance = self._rescale_2DBoundary(
-                self.boundaryDistributions[source],
-                target_reduction = kwargs.get('target_reduction'),
-                target_size = kwargs.get('target_size')
-                )
+            #
+            lat, lon, mjd, val_mu, val_sigma, = [], [], [], [], []
+            val_mu_noise_variance = []
+            val_sigma_noise_variance = []
+            for source in self.boundarySources:
+                
+                bound, noise_variance = self._rescale_2DBoundary(
+                    self.boundaryDistributions[source],
+                    target_reduction = kwargs.get('target_reduction'),
+                    target_size = kwargs.get('target_size')
+                    )
+                
+                val_mu_noise_variance.append(noise_variance[target_var+'_mu_grid'])
+                val_sigma_noise_variance.append(noise_variance[target_var+'_sigma_grid'])
+                
+                lon_1d = bound['lon_grid']
+                mjd_1d = bound['t_grid']
+                lat_1d = np.interp(mjd_1d, 
+                                   self.ephemeris[source].time.mjd, 
+                                   self.ephemeris[source].lat_c.to(u.deg).value)
+                
+                mjd_2d, lon_2d, = np.meshgrid(mjd_1d, lon_1d)
+                lat_2d, lon_2d, = np.meshgrid(lat_1d, lon_1d)
+                
+                val_mu_2d = bound[target_var+'_mu_grid']
+                val_sigma_2d = bound[target_var+'_sigma_grid']
+                
+                # We're going to transpose all of these 2D matrices
+                # So, when flattened, lon is the second (faster changing) dim
+                # And mjd/lat is the first (slower changing) dim
+                lat.extend(lat_2d.flatten())
+                lon.extend(lon_2d.flatten())
+                mjd.extend(mjd_2d.flatten())
+                
+                val_mu.extend(val_mu_2d.flatten())
+                val_sigma.extend(val_sigma_2d.flatten())
+                
+                # sample from val sample, rather than val mu?
+                # val.extend(rng.normal(loc=val_mu_2d.flatten(), 
+                #                       scale=val_sigma_2d.flatten()))
+              
+            # Recast as arrays
+            lon = np.array(lon)
+            lat = np.array(lat)
+            mjd = np.array(mjd)
             
-            val_mu_noise_variance.append(noise_variance['U_mu_grid'])
-            val_sigma_noise_variance.append(noise_variance['U_sig_grid'])
+            val_mu = np.array(val_mu)
+            val_sigma = np.array(val_sigma)
+            # log_val_sigma = np.log10(val_sigma)
             
-            lon_1d = bound['lon_grid']
-            mjd_1d = bound['t_grid']
-            lat_1d = np.interp(mjd_1d, 
-                               self.ephemeris[source].time.mjd, 
-                               self.ephemeris[source].lat_c.to(u.deg).value)
+            # Normalizations & NaN removal
+            xlat = lat_scaler.transform(lat[~np.isnan(val_mu),None])
+            xlon = lon_scaler.transform(lon[~np.isnan(val_mu),None])
+            xmjd = mjd_scaler.transform(mjd[~np.isnan(val_mu),None])
             
-            mjd_2d, lon_2d, = np.meshgrid(mjd_1d, lon_1d)
-            lat_2d, lon_2d, = np.meshgrid(lat_1d, lon_1d)
+            val_mu_scaler.fit(val_mu[:,None])
+            yval_mu = val_mu_scaler.transform(val_mu[~np.isnan(val_mu),None])
             
-            val_mu_2d = bound['U_mu_grid']
-            val_sigma_2d = bound['U_sig_grid']
+            val_sigma_scaler.fit(val_sigma[:,None])
+            yval_sigma = val_sigma_scaler.transform(val_sigma[~np.isnan(val_mu),None])
             
-            # We're going to transpose all of these 2D matrices
-            # So, when flattened, lon is the second (faster changing) dim
-            # And mjd/lat is the first (slower changing) dim
-            lat.extend(lat_2d.flatten())
-            lon.extend(lon_2d.flatten())
-            mjd.extend(mjd_2d.flatten())
+            all_scalers.update({target_var+'_mu': val_mu_scaler, target_var+'_sigma': val_sigma_scaler})
+    
+            # %% ==================================================================
+            # GP Kernel Definitions
+            # =====================================================================
             
-            val_mu.extend(val_mu_2d.flatten())
-            val_sigma.extend(val_sigma_2d.flatten())
+            lat_scale_min = 0 * lat_scaler.scale_
+            lat_scale_mid = 1 * lat_scaler.scale_
+            lat_scale_max = 3 * lat_scaler.scale_
+            lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
+               transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
+            # lat_lengthscale = gpflow.Parameter(lat_scale_mid)
             
-            # sample from val sample, rather than val mu?
-            # val.extend(rng.normal(loc=val_mu_2d.flatten(), 
-            #                       scale=val_sigma_2d.flatten()))
-          
-        # Recast as arrays
-        lon = np.array(lon)
-        lat = np.array(lat)
-        mjd = np.array(mjd)
-        
-        val_mu = np.array(val_mu)
-        val_sigma = np.array(val_sigma)
-        # log_val_sigma = np.log10(val_sigma)
-        
-        # Normalizations & NaN removal
-        xlat = lat_scaler.transform(lat[~np.isnan(val_mu),None])
-        xlon = lon_scaler.transform(lon[~np.isnan(val_mu),None])
-        xmjd = mjd_scaler.transform(mjd[~np.isnan(val_mu),None])
-        
-        val_mu_scaler.fit(val_mu[:,None])
-        yval_mu = val_mu_scaler.transform(val_mu[~np.isnan(val_mu),None])
-        
-        val_sigma_scaler.fit(val_sigma[:,None])
-        yval_sigma = val_sigma_scaler.transform(val_sigma[~np.isnan(val_mu),None])
-
-        # %% ==================================================================
-        # GP Kernel Definitions
-        # =====================================================================
-        
-        lat_scale_min = 0 * lat_scaler.scale_
-        lat_scale_mid = 1 * lat_scaler.scale_
-        lat_scale_max = 3 * lat_scaler.scale_
-        lat_lengthscale = gpflow.Parameter(lat_scale_mid, 
-           transform = tfp.bijectors.SoftClip(lat_scale_min, lat_scale_max))
-        # lat_lengthscale = gpflow.Parameter(lat_scale_mid)
-        
-        mjd_scale_min = 0.0
-        mjd_scale_mid = 3 * 25.38 * mjd_scaler.scale_
-        mjd_scale_max = 6 * 25.38 * mjd_scaler.scale_
-        # if mjd_scale_mid > 0.9: mjd_scale_mid[0] = 0.9
-        # if mjd_scale_max > 1.0: mjd_scale_max[0] = 1.0
-        mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
-           transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
-        # mjd_lengthscale = gpflow.Parameter(mjd_scale_mid)
-        
-        # lon_scale_min = np.float64(0.0)
-        lon_scale_mid = np.float64(1.0)
-        # lon_scale_max = np.float64(1.0)
-        # lon_lengthscale = gpflow.Parameter(lon_scale_mid, 
-        #    transform = tfp.bijectors.SoftClip(lon_scale_min, lon_scale_max))
-        lon_lengthscale = gpflow.Parameter(lon_scale_mid)
-        
-        lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0], lengthscales=lat_lengthscale)
-        
-        period_gp = gpflow.Parameter(1, trainable=False)
-        base_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
-        amplitude_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
-        period_kernel = gpflow.kernels.Periodic(
-            # gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
-            gpflow.kernels.SquaredExponential(active_dims=[1]), 
-            period=period_gp)
-        lon_kernel = base_kernel + amplitude_kernel * period_kernel
-                     
-        mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2], lengthscales=mjd_lengthscale)
-        
-        all_kernel = gpflow.kernels.RationalQuadratic()
-        kernel_mu = (lat_kernel + lon_kernel + mjd_kernel + 
-                     lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
-                     lat_kernel*lon_kernel*mjd_kernel + 
-                     all_kernel)
-        
-        kernel_sigma = copy.deepcopy(kernel_mu)
-        
-        # %% ==================================================================
-        # Optimize Clustering & Cluster
-        # =====================================================================
-        X = np.column_stack([xlat, xlon, xmjd])
-        Y_mu = yval_mu
-        Y_sigma = yval_sigma
-        
-        # Xc_mu, Yc_mu, opt_noise_mu = self._optimize_clustering(X, Y_mu, **kwargs)
-        # # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, 
-        # #     target_reduction=target_reduction, target_noise=target_noise, inX=True)
-        # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, **kwargs)
-
-        # XYc_mu = np.column_stack([Xc_mu, Yc_mu])
-        # XYc_sigma = np.column_stack([Xc_sigma, Yc_sigma])
-        
-        # Generous estimate; in general, the downsampling does not introduce substantial noise
-        opt_noise_mu = 0.005
-        opt_noise_sigma = 0.005
-
-        # %% ==================================================================
-        # Chunk Data for Processing
-        # =====================================================================
-        
-        Xc_mu_chunks, Yc_mu_chunks = self._optimize_chunking(X, Y_mu, **kwargs)
-        
-        Xc_sigma_chunks, Yc_sigma_chunks = self._optimize_chunking(X, Y_sigma, **kwargs)
-        
-        
-        fig, axs = plt.subplots(ncols=len(Xc_mu_chunks), figsize=[10,5], subplot_kw={'projection': '3d'})
-        for ax, Xchunk, Ychunk in zip(axs, Xc_mu_chunks, Yc_mu_chunks):
-            ax.scatter(Xchunk[:,2], Xchunk[:,1], Xchunk[:,0], c=Ychunk[:,0], 
-                       alpha=0.5, marker='.', s=36, vmin=-2, vmax=2)
+            mjd_scale_min = 0.0
+            mjd_scale_mid = 3 * 25.38 * mjd_scaler.scale_
+            mjd_scale_max = 6 * 25.38 * mjd_scaler.scale_
+            # if mjd_scale_mid > 0.9: mjd_scale_mid[0] = 0.9
+            # if mjd_scale_max > 1.0: mjd_scale_max[0] = 1.0
+            mjd_lengthscale = gpflow.Parameter(mjd_scale_mid, 
+               transform = tfp.bijectors.SoftClip(mjd_scale_min, mjd_scale_max))
+            # mjd_lengthscale = gpflow.Parameter(mjd_scale_mid)
+            
+            # lon_scale_min = np.float64(0.0)
+            lon_scale_mid = np.float64(1.0)
+            # lon_scale_max = np.float64(1.0)
+            # lon_lengthscale = gpflow.Parameter(lon_scale_mid, 
+            #    transform = tfp.bijectors.SoftClip(lon_scale_min, lon_scale_max))
+            lon_lengthscale = gpflow.Parameter(lon_scale_mid)
+            
+            lat_kernel = gpflow.kernels.RationalQuadratic(active_dims=[0], lengthscales=lat_lengthscale)
+            
+            period_gp = gpflow.Parameter(1, trainable=False)
+            base_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
+            amplitude_kernel = gpflow.kernels.RationalQuadratic(active_dims=[1], lengthscales=lon_lengthscale)
+            period_kernel = gpflow.kernels.Periodic(
+                # gpflow.kernels.SquaredExponential(active_dims=[1], lengthscales=period_gp), 
+                gpflow.kernels.SquaredExponential(active_dims=[1]), 
+                period=period_gp)
+            lon_kernel = base_kernel + amplitude_kernel * period_kernel
+                         
+            mjd_kernel = gpflow.kernels.RationalQuadratic(active_dims=[2], lengthscales=mjd_lengthscale)
+            
+            all_kernel = gpflow.kernels.RationalQuadratic()
+            kernel_mu = (lat_kernel + lon_kernel + mjd_kernel + 
+                         lat_kernel*lon_kernel + lat_kernel*mjd_kernel + lon_kernel*mjd_kernel +
+                         lat_kernel*lon_kernel*mjd_kernel + 
+                         all_kernel)
+            
+            kernel_sigma = copy.deepcopy(kernel_mu)
+            
+            # %% ==================================================================
+            # Optimize Clustering & Cluster
+            # =====================================================================
+            X = np.column_stack([xlat, xlon, xmjd])
+            Y_mu = yval_mu
+            Y_sigma = yval_sigma
+            
+            # Xc_mu, Yc_mu, opt_noise_mu = self._optimize_clustering(X, Y_mu, **kwargs)
+            # # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, 
+            # #     target_reduction=target_reduction, target_noise=target_noise, inX=True)
+            # Xc_sigma, Yc_sigma, opt_noise_sigma = self._optimize_clustering(X, Y_sigma, **kwargs)
+    
+            # XYc_mu = np.column_stack([Xc_mu, Yc_mu])
+            # XYc_sigma = np.column_stack([Xc_sigma, Yc_sigma])
+            
+            # Generous estimate; in general, the downsampling does not introduce substantial noise
+            opt_noise_mu = 0.005
+            opt_noise_sigma = 0.005
+    
+            # %% ==================================================================
+            # Chunk Data for Processing
+            # =====================================================================
+            
+            Xc_mu_chunks, Yc_mu_chunks = self._optimize_chunking(X, Y_mu, **kwargs)
+            
+            Xc_sigma_chunks, Yc_sigma_chunks = self._optimize_chunking(X, Y_sigma, **kwargs)
+            
+            
+            fig, axs = plt.subplots(ncols=len(Xc_mu_chunks), figsize=[10,5], subplot_kw={'projection': '3d'})
+            for ax, Xchunk, Ychunk in zip(axs, Xc_mu_chunks, Yc_mu_chunks):
+                ax.scatter(Xchunk[:,2], Xchunk[:,1], Xchunk[:,0], c=Ychunk[:,0], 
+                           alpha=0.5, marker='.', s=36, vmin=-2, vmax=2)
+                ax.set(xlabel='Time', ylabel='Longitude', zlabel='Latitude')
+                ax.view_init(elev=30., azim=80)
+            plt.show()
+    
+            # %% ==================================================================
+            # Run the GP Regression
+            # =====================================================================
+            SGPR = kwargs.get('SGPR', 0.1)
+            model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, opt_noise_mu, SGPR=SGPR)
+            model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, opt_noise_sigma, SGPR=SGPR)
+            
+            all_models.update({target_var+'_mu': model_mu,
+                               target_var+'_sigma': model_sigma})
+            
+            # =============================================================================
+            # Verify performance against input data    
+            # =============================================================================
+            model_mu_results = model_mu.predict_f(X, chunk_size=4096, cpu_fraction=0.75)
+            model_sigma_results = model_sigma.predict_f(X, chunk_size=4096, cpu_fraction=0.75)
+            diff_mu = model_mu_results[0] - Y_mu
+            diff_sigma = model_sigma_results[0] - Y_sigma
+            if (diff_mu.std() > 1) | (diff_sigma.std() > 1):
+                breakpoint()
+    
+            fig, axs = plt.subplots(ncols=2, figsize=[10,5], subplot_kw={'projection': '3d'})
+            temp_result_mu, temp_result_var = model_mu.predict_f(Xc_mu_chunks[1])
+            for ax, Ychunk in zip(axs, [Yc_mu_chunks[1], temp_result_mu]):
+                ax.scatter(Xc_mu_chunks[1][:,2], Xc_mu_chunks[1][:,1], Xc_mu_chunks[1][:,0], c=Ychunk[:,0], 
+                           alpha=0.5, marker='.', s=36, vmin=-2, vmax=2)
+                ax.set(xlabel='Time', ylabel='Longitude', zlabel='Latitude')
+                ax.view_init(elev=30., azim=130)
+            plt.show()
+            
+            fig, ax = plt.subplots(figsize=[5,5], subplot_kw={'projection': '3d'})
+    
+            ax.scatter(Xc_mu_chunks[1][:,2], Xc_mu_chunks[1][:,1], Xc_mu_chunks[1][:,0], c=temp_result_mu[:,0] - Yc_mu_chunks[1][:,0], 
+                           alpha=0.5, marker='.', s=36, vmin=-1, vmax=1)
+            
+            iv0 = model_mu.model_list[1].inducing_variable.Z
+            ax.scatter(iv0[:,2], iv0[:,1], iv0[:,0], color='black', marker='x', s=36)
+    
             ax.set(xlabel='Time', ylabel='Longitude', zlabel='Latitude')
-            ax.view_init(elev=30., azim=80)
-        plt.show()
-
-        # %% ==================================================================
-        # Run the GP Regression
-        # =====================================================================
-        SGPR = kwargs.get('SGPR', 0.1)
-        model_mu = GPFlowEnsemble(kernel_mu, Xc_mu_chunks, Yc_mu_chunks, opt_noise_mu, SGPR=SGPR)
-        model_sigma = GPFlowEnsemble(kernel_sigma, Xc_sigma_chunks, Yc_sigma_chunks, opt_noise_sigma, SGPR=SGPR)
-        # =============================================================================
-        # Verify performance against input data    
-        # =============================================================================
-        model_mu_results = model_mu.predict_f(X, chunk_size=4096, cpu_fraction=0.75)
-        model_sigma_results = model_sigma.predict_f(X, chunk_size=4096, cpu_fraction=0.75)
-        diff_mu = model_mu_results[0] - Y_mu
-        diff_sigma = model_sigma_results[0] - Y_sigma
-        if (diff_mu.std() > 1) | (diff_sigma.std() > 1):
-            breakpoint()
-
-        fig, axs = plt.subplots(ncols=2, figsize=[10,5], subplot_kw={'projection': '3d'})
-        temp_result_mu, temp_result_var = model_mu.predict_f(Xc_mu_chunks[1])
-        for ax, Ychunk in zip(axs, [Yc_mu_chunks[1], temp_result_mu]):
-            ax.scatter(Xc_mu_chunks[1][:,2], Xc_mu_chunks[1][:,1], Xc_mu_chunks[1][:,0], c=Ychunk[:,0], 
-                       alpha=0.5, marker='.', s=36, vmin=-2, vmax=2)
-            ax.set(xlabel='Time', ylabel='Longitude', zlabel='Latitude')
-            ax.view_init(elev=30., azim=130)
-        plt.show()
+            ax.view_init(elev=30., azim=70)
+            plt.show()
+            
+            
+            # %% ==================================================================
+            # Predict values for the full grid...     
+            # =====================================================================
+            Xlat, Xlon, Xmjd = np.meshgrid(lat_scaler.transform(lat_for3d[:,None]),
+                                           lon_scaler.transform(lon_for3d[:,None]), 
+                                           mjd_scaler.transform(mjd_for3d[:,None]),
+                                           indexing='ij')
+            X3d = np.column_stack([Xlat.flatten()[:,None],
+                                   Xlon.flatten()[:,None],
+                                   Xmjd.flatten()[:,None]])
+            
+            # Parallel chunk processing 
+            fmu3d_mu, fmu3d_var = model_mu.predict_f(X3d, chunk_size=4096, cpu_fraction=0.75)
+            # fmu_samples = model_mu.predict_f_samples(X3d, num_samples, chunk_size=4096, cpu_fraction=0.75)
+            
+            val_mu_mu = val_mu_scaler.inverse_transform(fmu3d_mu).reshape(nLat, nLon, nMjd)
+            val_mu_sig = val_mu_scaler.scale_ * tf.sqrt(fmu3d_var).numpy().reshape(nLat, nLon, nMjd)
+            
+            # For the standard deviation
+            fsig3d_mu, fsig3d_var = model_sigma.predict_f(X3d, chunk_size=4096, cpu_fraction=0.75)
+            # fsig_samples = model_sigma.predict_f_samples(X3d, num_samples, chunk_size=4096, cpu_fraction=0.75)
+            
+            val_sig_mu = val_sigma_scaler.inverse_transform(fsig3d_mu).reshape(nLat, nLon, nMjd)
+            
+            # The uncertainty on the uncertainty is difficult to quantify
+            
+            # Add to dictionaries
+            # all_summaries.update({target_var: {'mu': val_mu_mu, 'sigma': np.sqrt(val_mu_sig**2 + val_sig_mu**2)}})
+            all_summaries.update({target_var+'_mu': val_mu_mu,
+                                  target_var+'_sigma': np.sqrt(val_mu_sig**2 + val_sig_mu**2)})
+            
+            
+            # val_sig_sig = val_sigma_scaler.scale_ * tf.sqrt(fsig3d_var).reshape(nLat, nLon, nMjd)
+            # test0 = val_sigma_scaler.inverse_transform(fsig3d_mu + tf.sqrt(fsig3d_var)).reshape(nLat, nLon, nMjd) - val_sig_mu
+            # test1 = val_sig_mu - val_sigma_scaler.inverse_transform(fsig3d_mu - tf.sqrt(fsig3d_var)).reshape(nLat, nLon, nMjd)
+    
+            # !!!! Eventually, val will apply to both U and B...
+            # U_mu_3d = val_mu_mu
+            # U_sigma_3d = np.sqrt(val_mu_sig**2 + val_sig_mu**2)
         
-        fig, ax = plt.subplots(figsize=[5,5], subplot_kw={'projection': '3d'})
-
-        ax.scatter(Xc_mu_chunks[1][:,2], Xc_mu_chunks[1][:,1], Xc_mu_chunks[1][:,0], c=temp_result_mu[:,0] - Yc_mu_chunks[1][:,0], 
-                       alpha=0.5, marker='.', s=36, vmin=-1, vmax=1)
-        
-        iv0 = model_mu.model_list[1].inducing_variable.Z
-        ax.scatter(iv0[:,2], iv0[:,1], iv0[:,0], color='black', marker='x', s=36)
-
-        ax.set(xlabel='Time', ylabel='Longitude', zlabel='Latitude')
-        ax.view_init(elev=30., azim=70)
-        plt.show()
-        
-        
-        # %% ==================================================================
-        # Predict values for the full grid...     
-        # =====================================================================
-        Xlat, Xlon, Xmjd = np.meshgrid(lat_scaler.transform(lat_for3d[:,None]),
-                                       lon_scaler.transform(lon_for3d[:,None]), 
-                                       mjd_scaler.transform(mjd_for3d[:,None]),
-                                       indexing='ij')
-        X3d = np.column_stack([Xlat.flatten()[:,None],
-                               Xlon.flatten()[:,None],
-                               Xmjd.flatten()[:,None]])
-        
-        # Parallel chunk processing 
-        fmu3d_mu, fmu3d_var = model_mu.predict_f(X3d, chunk_size=4096, cpu_fraction=0.75)
-        # fmu_samples = model_mu.predict_f_samples(X3d, num_samples, chunk_size=4096, cpu_fraction=0.75)
-        
-        val_mu_mu = val_mu_scaler.inverse_transform(fmu3d_mu).reshape(nLat, nLon, nMjd)
-        val_mu_sig = val_mu_scaler.scale_ * tf.sqrt(fmu3d_var).numpy().reshape(nLat, nLon, nMjd)
-        
-
-        
-        # For the standard deviation
-        fsig3d_mu, fsig3d_var = model_sigma.predict_f(X3d, chunk_size=4096, cpu_fraction=0.75)
-        # fsig_samples = model_sigma.predict_f_samples(X3d, num_samples, chunk_size=4096, cpu_fraction=0.75)
-        
-        val_sig_mu = val_sigma_scaler.inverse_transform(fsig3d_mu).reshape(nLat, nLon, nMjd)
-        
-        # The uncertainty on the uncertainty is difficult to quantify
-        
-        # val_sig_sig = val_sigma_scaler.scale_ * tf.sqrt(fsig3d_var).reshape(nLat, nLon, nMjd)
-        # test0 = val_sigma_scaler.inverse_transform(fsig3d_mu + tf.sqrt(fsig3d_var)).reshape(nLat, nLon, nMjd) - val_sig_mu
-        # test1 = val_sig_mu - val_sigma_scaler.inverse_transform(fsig3d_mu - tf.sqrt(fsig3d_var)).reshape(nLat, nLon, nMjd)
-
-        # !!!! Eventually, val will apply to both U and B...
-        U_mu_3d = val_mu_mu
-        U_sigma_3d = np.sqrt(val_mu_sig**2 + val_sig_mu**2)
-        
-        breakpoint()
         
         # Generate an OBVIOUSLY WRONG B
-        B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
+        # B_3d = np.tile(self.boundaryDistributions['omni']['B_grid'], (64, 1, 1))
         
         # # %% ==================================================================
         # # TESTING PLOTS
@@ -1181,29 +1221,29 @@ class multihuxt_inputs:
         # Assign to self
         # Sample at OMNI/STA
         
-        return U_mu_3d, U_sigma_3d, B_3d
+        return all_summaries, all_scalers, all_models
         
-        # =============================================================================
-        # Visualization     
-        # =============================================================================
-        self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d, U_mu_3d, U_sigma_3d, B_3d)
+        # # =============================================================================
+        # # Visualization     
+        # # =============================================================================
+        # self._assign_boundaryDistributions3D(mjd_for3d, lon_for3d, lat_for3d, U_mu_3d, U_sigma_3d, B_3d)
         
-        for source in self.boundarySources:
+        # for source in self.boundarySources:
             
-            # Reconstruct the backmapped solar wind view at each source
-            fig, axs = plt.subplots(nrows=2)
+        #     # Reconstruct the backmapped solar wind view at each source
+        #     fig, axs = plt.subplots(nrows=2)
             
-            axs[0].imshow(self.boundaryDistributions[source]['U_mu_grid'],
-                          vmin=200, vmax=600)
+        #     axs[0].imshow(self.boundaryDistributions[source]['U_mu_grid'],
+        #                   vmin=200, vmax=600)
             
-            boundary = self.sample_boundaryDistribution3D(source)
-            _ = axs[1].imshow(boundary['U_mu_grid'],
-                              vmin=200, vmax=600)
+        #     boundary = self.sample_boundaryDistribution3D(source)
+        #     _ = axs[1].imshow(boundary['U_mu_grid'],
+        #                       vmin=200, vmax=600)
             
-            fig.suptitle(source)
-            # plt.colorbar(_, cax = ax)
+        #     fig.suptitle(source)
+        #     # plt.colorbar(_, cax = ax)
             
-            plt.show()
+        #     plt.show()
                 
             
         # breakpoint()
@@ -1216,38 +1256,76 @@ class multihuxt_inputs:
         # !!!! Catch exceptions better...
         if at not in self.availableSources:
             breakpoint()
+        
+        # Rescale all coordinates
+        lat = np.interp(self.boundaryDistributions3D['t_grid'],
+                        self.availableBackgroundData['mjd'],
+                        self.ephemeris[at].lat_c.to(u.deg).value)
+        x_lat = self._boundaryScalers['lon_grid'].transform(lat[:, None])
+        
+        x_lon = self._boundaryScalers['lon_grid'].transform(self.boundaryDistributions3D['lon_grid'][:, None])
+        
+        x_mjd = self._boundaryScalers['t_grid'].transform(self.boundaryDistributions3D['t_grid'][:, None])
+        
+        # Construct 2, 2D grid
+        x_lon2d, x_t2d = np.meshgrid(x_lon, x_mjd,indexing='ij')
+        x_lon2d, x_lat2d = np.meshgrid(x_lon, x_lat, indexing='ij')
+        
+        # Finally construct 1D list of coordinates
+        X = np.column_stack([x_lat2d.flatten()[:, None], 
+                             x_lon2d.flatten()[:, None],
+                             x_t2d.flatten()[:, None]])
+        
+        # Plug these into the model for samples
+        U_mu_samples = self._boundaryModels['U_mu'].predict_f_samples(X, 100, chunk_size=5000, cpu_fraction=0.75)
+        
+        U_sigma_samples = self._boundaryModels['U_sigma'].predict_f_samples(X, 100, chunk_size=5000, cpu_fraction=0.75)
+        
+        Br_mu_samples = self._boundaryModels['Br_mu'].predict_f_samples(X, 100, chunk_size=5000, cpu_fraction=0.75)
+        
+        Br_sigma_samples = self._boundaryModels['Br_sigma'].predict_f_samples(X, 100, chunk_size=5000, cpu_fraction=0.75)
+        
+        samples = []
+        # Convert back to real units
+        for U_mu_sample, U_sigma_sample, Br_mu_sample, Br_sigma_sample in zip(U_mu_samples, U_sigma_samples, Br_mu_samples, Br_sigma_samples):
+            U_mu = self._boundaryScalers['U_mu'].inverse_transform(U_mu_sample).reshape(x_lon2d.shape)
+            U_sigma = self._boundaryScalers['U_sigma'].inverse_transform(U_sigma_sample).reshape(x_lon2d.shape)
             
-        shape3D = self.boundaryDistributions3D['U_mu_grid'].shape
+            Br_mu = self._boundaryScalers['Br_mu'].inverse_transform(Br_mu_sample).reshape(x_lon2d.shape)
+            Br_sigma =  self._boundaryScalers['Br_sigma'].inverse_transform(Br_sigma_sample).reshape(x_lon2d.shape)
             
-        # Get the HGI latitude of the target at times matching the boundary grid
-        target_lats = np.interp(self.boundaryDistributions3D['t_grid'],
-                                self.availableBackgroundData['mjd'],
-                                self.ephemeris[at].lat_c.to(u.deg).value)
+            d = self.boundaryDistributions3D.copy()
+            _ = d.pop('lat_grid')
+            d['U_mu_grid'] = U_mu
+            d['U_sigma_grid'] = U_sigma
+            d['Br_mu_grid'] = Br_mu
+            d['Br_sigma_grid'] = Br_sigma
+            
+            samples.append(d)
+            
+        summary = self.boundaryDistributions3D.copy()
+        _ = summary.pop('lat_grid')
+        summary['U_mu_grid'] = U_mu_samples.mean(axis=0).reshape(x_lon2d.shape)
+        summary['U_sigma_grid'] = U_sigma_samples.mean(axis=0).reshape(x_lon2d.shape)
+        summary['Br_mu_grid'] = Br_mu_samples.mean(axis=0).reshape(x_lon2d.shape)
+        summary['Br_sigma_grid'] = Br_sigma_samples.mean(axis=0).reshape(x_lon2d.shape)
         
+        # interp_mu = RegularGridInterpolator((self.boundaryDistributions3D['lat_grid'], 
+        #                                      self.boundaryDistributions3D['lon_grid'], 
+        #                                      self.boundaryDistributions3D['t_grid']), 
+        #                                     self.boundaryDistributions3D['U_mu_grid'])
         
-        lon2d, t2d = np.meshgrid(self.boundaryDistributions3D['lon_grid'], 
-                                 self.boundaryDistributions3D['t_grid'],
-                                 indexing='ij')
-        lon2d, lat2d = np.meshgrid(self.boundaryDistributions3D['lon_grid'],
-                                   target_lats,
-                                   indexing='ij')
+        # U_mu_2d = interp_mu(np.column_stack((lat2d.flatten(), lon2d.flatten(), t2d.flatten()))).reshape(lon2d.shape)
         
-        interp_mu = RegularGridInterpolator((self.boundaryDistributions3D['lat_grid'], 
-                                             self.boundaryDistributions3D['lon_grid'], 
-                                             self.boundaryDistributions3D['t_grid']), 
-                                            self.boundaryDistributions3D['U_mu_grid'])
+        # interp_sigma = RegularGridInterpolator((self.boundaryDistributions3D['lat_grid'], 
+        #                                      self.boundaryDistributions3D['lon_grid'], 
+        #                                      self.boundaryDistributions3D['t_grid']), 
+        #                                     self.boundaryDistributions3D['U_sig_grid'])
         
-        U_mu_2d = interp_mu(np.column_stack((lat2d.flatten(), lon2d.flatten(), t2d.flatten()))).reshape(lon2d.shape)
+        # U_sigma_2d = interp_sigma(np.column_stack((lat2d.flatten(), lon2d.flatten(), t2d.flatten()))).reshape(lon2d.shape)
         
-        interp_sigma = RegularGridInterpolator((self.boundaryDistributions3D['lat_grid'], 
-                                             self.boundaryDistributions3D['lon_grid'], 
-                                             self.boundaryDistributions3D['t_grid']), 
-                                            self.boundaryDistributions3D['U_sig_grid'])
-        
-        U_sigma_2d = interp_sigma(np.column_stack((lat2d.flatten(), lon2d.flatten(), t2d.flatten()))).reshape(lon2d.shape)
-        
-        # AGAIN, CLEARLY WRONG B!!!!
-        B_grid = self.boundaryDistributions3D['B_grid'][0,:,:]
+        # # AGAIN, CLEARLY WRONG B!!!!
+        # B_grid = self.boundaryDistributions3D['B_grid'][0,:,:]
         
         # breakpoint()
         # # Visualization
@@ -1270,11 +1348,7 @@ class multihuxt_inputs:
         #     plt.show()
         
         
-        return {'t_grid': self.boundaryDistributions3D['t_grid'],
-                'lon_grid': self.boundaryDistributions3D['lon_grid'],
-                'U_mu_grid': U_mu_2d, 
-                'U_sig_grid': U_sigma_2d,
-                'B_grid': B_grid}
+        return summary, samples
     
     def generate_cmeDistribution(self, search=True):
         
