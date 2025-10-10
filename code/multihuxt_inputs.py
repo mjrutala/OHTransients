@@ -297,7 +297,8 @@ class multihuxt_inputs:
             icme_df = self.availableTransientData
             
         # Drop ICME columns already assigned to self.availableBackgroundData
-        self.availableBackgroundData.drop('ICME', axis=1, level=1, inplace=True)
+        if 'ICME' in self.availableBackgroundData.columns.get_level_values(1):
+            self.availableBackgroundData.drop('ICME', axis=1, level=1, inplace=True)
         
         for source in self.availableSources:
             
@@ -367,7 +368,7 @@ class multihuxt_inputs:
 
     def generate_backgroundDistributions(self,
                                          inducing_variable=True,
-                                         GP = False, extend = False,
+                                         GP = False, interpolate = False,
                                          target_noise = 1e-2,
                                          max_chunk_length = 1024,
                                          n_samples = 1):
@@ -408,13 +409,16 @@ class multihuxt_inputs:
                 all_scalers.update({source: scalers})
                 all_models.update({source: models})
                 
-            elif type(extend) is str:
+            elif interpolate is True:
                 # self._backgroundDistributionMethod = 'extend'
                 
                 summary = self._extend_backgroundDistributions(
                     insitu_df,
-                    target_variables=['U'],
+                    target_variables=target_variables,
                     n_samples=n_samples)
+                
+                all_scalers.update({})
+                all_models.update({})
                 
             else:
                 print("Cannot have extend=str and GP=True!")
@@ -455,8 +459,14 @@ class multihuxt_inputs:
         
         if len(self._backgroundScalers.keys()) == 0:
             # Background is linearly interpolated, without uncertainty
-            pass
-            
+            # All samples are identical
+            for i in range(n_samples):
+                samples[i] = samples[i].rename(columns={'U_mu': 'U', 'Br_mu': 'Br'})
+                if 'U_sigma' in samples[i].columns.get_level_values(1):
+                    samples[i] = samples[i].drop(columns='U_sigma', level=1)
+                if 'Br_sigma' in samples[i].columns.get_level_values(1):
+                    samples[i] = samples[i].drop(columns='Br_sigma', level=1)
+
         else:
             # Background is found with 1D Gaussian Process regression
             for source in self._backgroundModels.keys():
@@ -559,15 +569,70 @@ class multihuxt_inputs:
         
         # return
     
-    def _extend_backgroundDistributions(self, df,
+    def _extend_backgroundDistributions(self, input_df,
                                         target_variables = ['U', 'Br'],
                                         noise_constant = 0.0,
                                         n_samples = 0):
         
-        print("_extend_backgroundDistributions has not yet been implemented!")
-        breakpoint()
         
-        return backgroundDistribution_df, backgroundSamples
+        # Use df, which already has NaNs where ICMEs are present
+        
+        df = input_df.copy()
+        
+        # Simulate HUXt ICME removal:
+        # Define a window twice as wide as the interp buffer, then truncate the
+        # rolling window where the ICME is
+        # The last and first values surrounding the ICME are thus a window-length mean
+        # Then interpolate these, and fill back in for the original df, only where the ICME is present
+        window = datetime.timedelta(days=2*self._icme_interp_buffer.to(u.day).value)
+        test = df[target_variables].rolling(window, center=True).mean()
+        test[df['ICME']] = np.nan
+        
+        smooth_interp = test.interpolate('linear', limit_direction='both')
+        
+        for var in target_variables:
+            df.loc[:, var+'_mu'] = df.loc[:, var]
+            df.loc[df['ICME'], var+'_mu'] = smooth_interp.loc[df['ICME'], var]
+            df.loc[:, var+'_sigma'] = 0.0
+            
+            df.drop(columns=var, inplace=True)
+
+        return df
+        
+        # for source in self.boundarySources:
+            
+        #     # Format insitu data for HUXt's remove_ICMEs function
+        #     # insitu = self.availableBackgroundData[source].copy()
+        #     insitu.loc[:, 'mjd'] = self.availableBackgroundData.loc[:, 'mjd']
+            
+        #     # Format ICME data for HUXt's remove_ICMEs function
+        #     icmes = self.availableTransientData.query('affiliated_source == @source')
+        #     icmes.reset_index(inplace=True, drop=True)
+            
+        #     if 'eventTime' in icmes.columns: 
+        #         icmes = icmes.rename(columns = {'eventTime': 'Shock_time'})
+        #         icmes['ICME_end'] = [row['Shock_time'] + datetime.timedelta(days=(row['duration'])) 
+        #                              for _, row in icmes.iterrows()]
+            
+        #     # Interpolate over existing data gaps (NaNs), so they aren't caught as ICMEs
+        #     # insitu.interpolate(method='linear', axis='columns', limit_direction='both', inplace=True)
+            
+            
+        #     breakpoint()
+        #     # Extract the timesteps during which there is an ICME
+        #     if len(icmes) > 0:
+        #         insitu_noicme = Hin.remove_ICMEs(insitu, icmes, 
+        #                                          params=['U', 'Br'], 
+        #                                          interpolate = True, 
+        #                                          icme_buffer = self._icme_duration_buffer, 
+        #                                          interp_buffer = self._icme_interp_buffer)
+                
+                
+        # print("_extend_backgroundDistributions has not yet been implemented!")
+        # breakpoint()
+                
+        
+        # return backgroundDistribution_df, backgroundSamples
     
     def _impute_backgroundDistributions(self, df, carrington_period,
                                         target_variables = ['U', 'Br'],
@@ -635,10 +700,12 @@ class multihuxt_inputs:
             Xc_chunks = [chunk[:,0][:,None] for chunk in XYc_chunks]
             Yc_chunks = [chunk[:,1][:,None] for chunk in XYc_chunks]
             
+            breakpoint()
+            
             # =============================================================================
             # Plug into the ensemble GP model
             # =============================================================================
-            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, optimized_noise)
+            model = GPFlowEnsemble(kernel, Xc_chunks, Yc_chunks, 0.05) # optimized_noise)
             bgGPModels.update({target_var: model})
             
             # =================================================================
@@ -1119,6 +1186,10 @@ class multihuxt_inputs:
             all_models.update({target_var+'_mu': model_mu,
                                target_var+'_sigma': model_sigma})
             
+            # !!!!! TESTING
+            # fit a 2D lon x time image exactly
+            # Then degrade the image to measure model efficacy
+            
             # =============================================================================
             # Verify performance against input data    
             # =============================================================================
@@ -1143,8 +1214,11 @@ class multihuxt_inputs:
             ax.scatter(Xc_mu_chunks[1][:,2], Xc_mu_chunks[1][:,1], Xc_mu_chunks[1][:,0], c=temp_result_mu[:,0] - Yc_mu_chunks[1][:,0], 
                            alpha=0.5, marker='.', s=36, vmin=-1, vmax=1)
             
-            iv0 = model_mu.model_list[1].inducing_variable.Z
-            ax.scatter(iv0[:,2], iv0[:,1], iv0[:,0], color='black', marker='x', s=36)
+            try:
+                iv0 = model_mu.model_list[1].inducing_variable.Z
+                ax.scatter(iv0[:,2], iv0[:,1], iv0[:,0], color='black', marker='x', s=36)
+            except:
+                pass
     
             ax.set(xlabel='Time', ylabel='Longitude', zlabel='Latitude')
             ax.view_init(elev=30., azim=70)
@@ -1305,10 +1379,10 @@ class multihuxt_inputs:
             
         summary = self.boundaryDistributions3D.copy()
         _ = summary.pop('lat_grid')
-        summary['U_mu_grid'] = U_mu_samples.mean(axis=0).reshape(x_lon2d.shape)
-        summary['U_sigma_grid'] = U_sigma_samples.mean(axis=0).reshape(x_lon2d.shape)
-        summary['Br_mu_grid'] = Br_mu_samples.mean(axis=0).reshape(x_lon2d.shape)
-        summary['Br_sigma_grid'] = Br_sigma_samples.mean(axis=0).reshape(x_lon2d.shape)
+        summary['U_mu_grid'] = self._boundaryScalers['U_mu'].inverse_transform(U_mu_samples.mean(axis=0)).reshape(x_lon2d.shape)
+        summary['U_sigma_grid'] = self._boundaryScalers['U_sigma'].inverse_transform(U_sigma_samples.mean(axis=0)).reshape(x_lon2d.shape)
+        summary['Br_mu_grid'] = self._boundaryScalers['Br_mu'].inverse_transform(Br_mu_samples.mean(axis=0)).reshape(x_lon2d.shape)
+        summary['Br_sigma_grid'] = self._boundaryScalers['Br_sigma'].inverse_transform(Br_sigma_samples.mean(axis=0)).reshape(x_lon2d.shape)
         
         # interp_mu = RegularGridInterpolator((self.boundaryDistributions3D['lat_grid'], 
         #                                      self.boundaryDistributions3D['lon_grid'], 
@@ -2032,23 +2106,31 @@ class GPFlowEnsemble:
             # kernel = self.kernel
             
             if self.type == 'GPR':
-                model = gpflow.models.GPR((X, Y),
-                                          kernel=kernel,
-                                          noise_variance=self.noise_variance)
+                try:
+                    model = gpflow.models.GPR((X, Y),
+                                              kernel=kernel,
+                                              noise_variance=self.noise_variance
+                                              )
+                except:
+                    breakpoint()
+                    
             elif self.type == 'SGPR':
                 # aim for 20 points
                 stepsize = int(np.round(1/self.inducing_point_fraction))
                 print("Step size for SGPR: {}".format(stepsize))
                 model = gpflow.models.SGPR((X, Y),
                                            kernel=kernel,
-                                           noise_variance=self.noise_variance,
+                                           # noise_variance=self.noise_variance,
                                            inducing_variable=X[::stepsize,:],
                                            )
             else:
                 breakpoint()
-    
-            opt = gpflow.optimizers.Scipy()
-            opt.minimize(model.training_loss, model.trainable_variables)
+            
+            try:
+                opt = gpflow.optimizers.Scipy()
+                opt.minimize(model.training_loss, model.trainable_variables)
+            except:
+                breakpoint()
             
             self.model_list.append(model)
             
